@@ -13,6 +13,7 @@ Expected repo layout:
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -73,33 +74,178 @@ def dem_stats(dem: np.ndarray) -> Dict[str, float]:
     }
 
 
-def load_dem_geotiff(path: Path) -> np.ndarray:
+# --------------------------------------------------------------------------- georeferencing
+DEFAULT_TARGET_CRS = "EPSG:32628"  # WGS 84 / UTM zone 28N (metric on the ground at La Palma)
+DEFAULT_EMISSION_LAYER = "emision_pto"
+# Mercator variants: map units are metres, but ground distances are scaled by 1/cos(lat).
+_NON_METRIC_PROJECTED_EPSG = {3857, 3395, 900913, 3785, 102100}
+
+
+@dataclass
+class DEM:
+    """Elevation grid (float64, NaN = nodata) plus its georeferencing."""
+
+    elevation: np.ndarray
+    transform: Optional["Affine"] = None
+    crs: Optional["CRS"] = None
+    cell_size_m: Optional[float] = None
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self.elevation.shape  # type: ignore[return-value]
+
+    @property
+    def nodata_mask(self) -> np.ndarray:
+        return ~np.isfinite(self.elevation)
+
+
+@dataclass
+class EmissionPoint:
+    row: int
+    col: int
+    x: float
+    y: float
+
+
+def _require_rasterio() -> None:
     if rasterio is None:
         raise RuntimeError("rasterio is required to load GeoTIFF DEMs. Install with: pip install rasterio")
+
+
+def ground_cell_size(transform: "Affine", crs: Optional["CRS"]) -> Optional[float]:
+    """Return the ground cell size in metres, or None if the grid cannot provide one.
+
+    A cell size is only trusted when the CRS is projected, not a Mercator variant (whose
+    "metres" are inflated by 1/cos(latitude)), and the pixels are square.
+    """
+    dx, dy = abs(transform.a), abs(transform.e)
+    if crs is None or not crs.is_projected:
+        return None
+    if crs.to_epsg() in _NON_METRIC_PROJECTED_EPSG:
+        return None
+    if not np.isclose(dx, dy, rtol=1e-6, atol=0.0):
+        return None
+    return float(dx)
+
+
+def load_dem(
+    path: Path,
+    target_crs: Optional[str] = DEFAULT_TARGET_CRS,
+    resolution_m: Optional[float] = None,
+    cell_size_override_m: Optional[float] = None,
+) -> DEM:
+    """Load a GeoTIFF DEM, optionally reprojecting it (bilinear) to ``target_crs``.
+
+    Nodata pixels become NaN. The cell size is read from the (reprojected) transform;
+    ``cell_size_override_m`` replaces it and emits a warning, because areas and volumes
+    are then inconsistent with the georeferenced grid.
+    """
+    _require_rasterio()
+    from rasterio.crs import CRS
+    from rasterio.warp import Resampling, calculate_default_transform, reproject
+
     with rasterio.open(path) as src:
-        return src.read(1).astype(np.float32)
+        data = src.read(1).astype(np.float64)
+        if src.nodata is not None:
+            data[data == src.nodata] = np.nan
+        src_crs, src_transform = src.crs, src.transform
+        dst_crs = CRS.from_user_input(target_crs) if target_crs is not None else None
+
+        if dst_crs is None or dst_crs == src_crs:
+            elevation, transform, crs = data, src_transform, src_crs
+        else:
+            res = None if resolution_m is None else (resolution_m, resolution_m)
+            transform, width, height = calculate_default_transform(
+                src_crs, dst_crs, src.width, src.height, *src.bounds, resolution=res
+            )
+            elevation = np.full((height, width), np.nan, dtype=np.float64)
+            reproject(
+                source=data,
+                destination=elevation,
+                src_transform=src_transform,
+                src_crs=src_crs,
+                src_nodata=np.nan,
+                dst_transform=transform,
+                dst_crs=dst_crs,
+                dst_nodata=np.nan,
+                resampling=Resampling.bilinear,
+            )
+            crs = dst_crs
+
+    cell = ground_cell_size(transform, crs)
+    if cell_size_override_m is not None:
+        warnings.warn(
+            f"Overriding the georeferenced cell size ({cell if cell is not None else 'undefined'} m) "
+            f"with {cell_size_override_m} m; areas and volumes will not match the DEM grid.",
+            UserWarning,
+            stacklevel=2,
+        )
+        cell = float(cell_size_override_m)
+    elif cell is None:
+        warnings.warn(
+            f"DEM in {crs} has no reliable ground cell size (geographic/Mercator CRS or "
+            "non-square pixels); reproject it to a metric CRS before simulating.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return DEM(elevation=elevation, transform=transform, crs=crs, cell_size_m=cell)
 
 
-def load_emission_point_from_gpkg(gpkg_path: Path) -> Tuple[int, int]:
+def load_emission_point(
+    gpkg_path: Path,
+    dem: DEM,
+    layer: str = DEFAULT_EMISSION_LAYER,
+    sea_level_m: float = 0.0,
+) -> EmissionPoint:
+    """Read the vent from a GeoPackage layer, reproject it to the DEM CRS and validate it.
+
+    Raises ValueError if the point falls outside the DEM, on nodata, or on the sea.
+    """
     if gpd is None:
-        raise RuntimeError("geopandas is required to read emission point from GPKG. Install with: pip install geopandas")
-    gdf = gpd.read_file(gpkg_path)
+        raise RuntimeError("geopandas is required to read the emission point. Install with: pip install geopandas")
+    from rasterio.transform import rowcol
+
+    gdf = gpd.read_file(gpkg_path, layer=layer)
     if len(gdf) < 1:
-        raise ValueError(f"No features found in {gpkg_path}")
-    geom = gdf.geometry.iloc[0]
+        raise ValueError(f"No features found in layer '{layer}' of {gpkg_path}")
+    if len(gdf) > 1:
+        warnings.warn(f"Layer '{layer}' has {len(gdf)} features; using the first one.", UserWarning, stacklevel=2)
+    if gdf.crs is None:
+        raise ValueError(f"Layer '{layer}' of {gpkg_path} has no CRS; cannot place the vent on the DEM.")
+    geom = gdf.to_crs(dem.crs).geometry.iloc[0]
     x, y = float(geom.x), float(geom.y)
-    # same simple behavior as your original notebook
-    return int(round(y)), int(round(x))  # (row, col)
+
+    row, col = rowcol(dem.transform, x, y)
+    row, col = int(row), int(col)
+    nrows, ncols = dem.shape
+    if not (0 <= row < nrows and 0 <= col < ncols):
+        raise ValueError(
+            f"Emission point ({x:.1f}, {y:.1f}) in {dem.crs} falls outside the DEM "
+            f"(pixel {row}, {col}; grid is {nrows} x {ncols})."
+        )
+    z = dem.elevation[row, col]
+    if not np.isfinite(z):
+        raise ValueError(f"Emission point ({x:.1f}, {y:.1f}) falls on a nodata pixel ({row}, {col}).")
+    if z <= sea_level_m:
+        raise ValueError(
+            f"Emission point ({x:.1f}, {y:.1f}) falls on the sea: elevation {z:.1f} m <= sea level "
+            f"({sea_level_m} m) at pixel ({row}, {col})."
+        )
+    return EmissionPoint(row=row, col=col, x=x, y=y)
+
+
+def summit_rc(elevation: np.ndarray) -> Tuple[int, int]:
+    """(row, col) of the highest valid cell; used as the vent for synthetic DEMs."""
+    r, c = np.unravel_index(np.nanargmax(elevation), elevation.shape)
+    return int(r), int(c)
 
 
 def choose_emission_point(dem: np.ndarray, emission_rc: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
-    if emission_rc is not None:
-        r, c = emission_rc
-        r = int(np.clip(r, 0, dem.shape[0] - 1))
-        c = int(np.clip(c, 0, dem.shape[1] - 1))
-        return r, c
-    idx = np.nanargmax(dem)
-    r, c = np.unravel_index(idx, dem.shape)
+    if emission_rc is None:
+        return summit_rc(dem)
+    r, c = emission_rc
+    if not (0 <= r < dem.shape[0] and 0 <= c < dem.shape[1]):
+        raise ValueError(f"Emission point {emission_rc} is outside the grid {dem.shape}.")
     return int(r), int(c)
 
 
@@ -359,7 +505,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pulses", type=int, default=3)
     p.add_argument("--pulse-minutes", type=int, default=60)
     p.add_argument("--rate", type=float, default=1000.0)
-    p.add_argument("--cell-size", type=float, default=10.0)
+    p.add_argument("--emission-layer", type=str, default=DEFAULT_EMISSION_LAYER)
+    p.add_argument("--target-crs", type=str, default=DEFAULT_TARGET_CRS,
+                   help="CRS the real DEM is reprojected to (bilinear). Default: UTM 28N.")
+    p.add_argument("--resolution", type=float, default=None,
+                   help="Target resolution (m) of the reprojected DEM. Default: chosen by GDAL.")
+    p.add_argument("--cell-size", type=float, default=None,
+                   help="Real mode: override the cell size read from the DEM (emits a warning). "
+                        "Gaussian mode: cell size of the synthetic grid (default 10 m).")
     p.add_argument("--snapshot-every", type=int, default=1)
     p.add_argument("--max-minutes-per-pulse", type=int, default=240)
     p.add_argument("--no-gif", action="store_true")
@@ -377,25 +530,29 @@ def main() -> int:
     out_dir = ensure_dir(Path(args.output_dir))
 
     if args.mode == "gaussian":
-        dem = gaussian_dem(n=args.n, height=args.height, sigma=args.sigma)
+        elevation = gaussian_dem(n=args.n, height=args.height, sigma=args.sigma)
+        cell_size = float(args.cell_size) if args.cell_size is not None else 10.0
+        dem = DEM(elevation=elevation.astype(np.float64), cell_size_m=cell_size)
+        emission_rc = summit_rc(dem.elevation)
     else:
         dem_path = Path(args.dem_path)
         if not dem_path.is_absolute():
             dem_path = data_dir / dem_path
-        dem = load_dem_geotiff(dem_path)
-
-    emission_rc: Optional[Tuple[int, int]] = None
-    gpkg = Path(args.emission_gpkg)
-    if not gpkg.is_absolute():
-        gpkg = data_dir / gpkg
-    if gpkg.exists():
-        try:
-            emission_rc = load_emission_point_from_gpkg(gpkg)
-        except Exception:
-            emission_rc = None
+        gpkg = Path(args.emission_gpkg)
+        if not gpkg.is_absolute():
+            gpkg = data_dir / gpkg
+        dem = load_dem(dem_path, target_crs=args.target_crs, resolution_m=args.resolution,
+                       cell_size_override_m=args.cell_size)
+        if dem.cell_size_m is None:
+            raise SystemExit("The DEM has no reliable ground cell size; use a metric --target-crs.")
+        vent = load_emission_point(gpkg, dem, layer=args.emission_layer)
+        emission_rc = (vent.row, vent.col)
+        print(f"DEM: {dem.shape[0]} x {dem.shape[1]} cells, {dem.cell_size_m:.2f} m, CRS {dem.crs}")
+        print(f"Vent: pixel ({vent.row}, {vent.col}), x={vent.x:.1f}, y={vent.y:.1f}, "
+              f"z={dem.elevation[vent.row, vent.col]:.1f} m")
 
     params = SimulationParams(
-        cell_size_m=float(args.cell_size),
+        cell_size_m=float(dem.cell_size_m),
         emission_rate_m3_per_min=float(args.rate),
         pulse_minutes=int(args.pulse_minutes),
         pulses=int(args.pulses),
@@ -404,7 +561,7 @@ def main() -> int:
     )
 
     run_simulation(
-        dem=dem,
+        dem=dem.elevation,
         params=params,
         output_dir=out_dir,
         emission_rc=emission_rc,
