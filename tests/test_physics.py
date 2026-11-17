@@ -38,6 +38,15 @@ def test_gaussian_footprint_grows_beyond_3x3_and_front_advances():
     assert front[5] < front[10] < front[20]
 
 
+def test_propagation_beyond_3x3_does_not_depend_on_default_cooling():
+    """Even with the original, much faster cooling (0.03/min) lava leaves the 3x3 block."""
+    model = _gaussian_model(n=60, cooling_constant_per_min=0.03)
+    for _ in range(20):
+        model.step(RATE)
+    assert model.footprint().sum() > 9
+    assert _front_distance(model) > np.sqrt(2)
+
+
 # ------------------------------------------------------------------------ mass balance
 def _assert_balance(model: "lf.LavaFlowModel") -> None:
     mb = model.mass_balance()

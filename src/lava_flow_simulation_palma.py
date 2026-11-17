@@ -251,7 +251,11 @@ class SimulationParams:
 
     initial_temp_c: float = 1150.0
     ambient_temp_c: float = 25.0
-    cooling_constant_per_min: float = 0.03
+    # Bulk Newtonian cooling rate. 0.003/min means lava erupted at 1150 C reaches the
+    # 900 C solidification threshold ~84 min after leaving the vent (if not remixed with
+    # hotter lava). Illustrative value, not derived from field data. The former default
+    # (0.03/min, ~8 min) combined with mu(T0)/mu(T) mobility froze flows near the vent.
+    cooling_constant_per_min: float = 0.003
     solidification_temp_c: float = 900.0
 
     viscosity_ref_pa_s: float = 1e5
