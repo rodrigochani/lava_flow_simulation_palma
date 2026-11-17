@@ -288,7 +288,10 @@ def newton_cooling(temp_c: np.ndarray, params: SimulationParams, dt_min: float =
 
 # Cell kinds on the padded grid.
 LAND, SEA, BOUNDARY = 0, 1, 2
-_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+# Moore neighbourhood: (dr, dc, distance in cell units).
+_NEIGHBOURS = [
+    (dr, dc, float(np.hypot(dr, dc))) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)
+]
 
 
 class LavaFlowModel:
@@ -414,27 +417,33 @@ class LavaFlowModel:
         # 3. Mobility.
         mob = mobility(temp, p)
 
-        # 4. Flow towards lower neighbours (synchronous update). Each volume q moved
-        #    from A to B carries heat q*T_A, so B ends at the volume-weighted mean
-        #    temperature of its previous lava and the incoming lava.
+        # 4. Flow towards lower neighbours (synchronous update).
+        #    - outflow = flow_coef * mobility * min(h, max_drop / 2): moving more than half
+        #      of the largest surface drop would invert the gradient with the lowest
+        #      neighbour (overshoot / checkerboard oscillations on gentle slopes);
+        #    - it is split among lower neighbours in proportion to the surface slope
+        #      (drop / distance; diagonals are sqrt(2) cells away);
+        #    - each volume q moved from A to B carries heat q*T_A, so B ends at the
+        #      volume-weighted mean temperature of its previous and incoming lava.
         z = self._ground + self._solid + h
         new_h = h.copy()
         new_heat = heat.copy()
         for r, c in np.argwhere(h > p.lava_epsilon_m):
             downhill = []
-            for dr, dc in _NEIGHBOURS:
+            for dr, dc, dist in _NEIGHBOURS:
                 d = z[r, c] - z[r + dr, c + dc]
                 if d > 0:
-                    downhill.append((r + dr, c + dc, d))
+                    downhill.append((r + dr, c + dc, d, d / dist))
             if not downhill:
                 continue
-            out = min(p.flow_coef * float(mob[r, c]) * h[r, c], h[r, c])
+            max_drop = max(d for _, _, d, _ in downhill)
+            out = p.flow_coef * float(mob[r, c]) * min(h[r, c], 0.5 * max_drop)
             t_src = temp[r, c]
-            dsum = sum(d for _, _, d in downhill)
+            ssum = sum(sl for _, _, _, sl in downhill)
             new_h[r, c] -= out
             new_heat[r, c] -= out * t_src
-            for rr, cc, d in downhill:
-                q = out * (d / dsum)
+            for rr, cc, _, sl in downhill:
+                q = out * (sl / ssum)
                 new_h[rr, cc] += q
                 new_heat[rr, cc] += q * t_src
         h[:] = new_h
