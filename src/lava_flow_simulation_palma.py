@@ -341,6 +341,7 @@ class LavaFlowModel:
         self._heat = np.zeros(self._ground.shape)  # heat content h*T (m * degC)
 
         self.minute = 0
+        self._search: Optional[Tuple[int, int, int, int]] = None  # see _window()
         self.emitted_m3 = 0.0
         self.lost_sea_m3 = 0.0
         self.lost_boundary_m3 = 0.0
@@ -374,11 +375,13 @@ class LavaFlowModel:
         return (self.lava > eps) | (self.solid > eps)
 
     def set_state(self, lava: np.ndarray, temperature: np.ndarray, solid: Optional[np.ndarray] = None) -> None:
-        """Overwrite the state (used by tests). Lava already present is not counted as emitted."""
+        """Overwrite the state (used by tests). The volumes set here are added to
+        ``emitted_m3`` so that the mass balance stays closed."""
         self._h[1:-1, 1:-1] = lava
         self._heat[1:-1, 1:-1] = np.where(lava > 0, lava * temperature, 0.0)
         if solid is not None:
             self._solid[1:-1, 1:-1] = solid
+        self._search = None  # rescan the full grid on the next step
         self.emitted_m3 += float(np.sum(lava) + (0.0 if solid is None else np.sum(solid))) * self.cell_area_m2
 
     # ----------------------------------------------------------- bookkeeping
@@ -399,28 +402,58 @@ class LavaFlowModel:
         }
 
     # -------------------------------------------------------------- dynamics
+    def _window(self) -> Tuple[slice, slice]:
+        """Padded-grid window holding every cell with lava (and the vent) plus a 1-cell margin.
+
+        Lava moves at most one cell per step, so the next search only needs the previous
+        window grown by one cell; the full grid is never scanned after the first step.
+        """
+        nr, nc = self._h.shape
+        if self._search is None:
+            r0, r1, c0, c1 = 0, nr - 1, 0, nc - 1
+        else:
+            r0, r1, c0, c1 = self._search
+        sub = self._h[r0 : r1 + 1, c0 : c1 + 1] > 0
+        rows = np.flatnonzero(sub.any(axis=1))
+        cols = np.flatnonzero(sub.any(axis=0))
+        vr, vc = self._vent_p
+        lo_r = min(vr, r0 + rows[0]) if rows.size else vr
+        hi_r = max(vr, r0 + rows[-1]) if rows.size else vr
+        lo_c = min(vc, c0 + cols[0]) if cols.size else vc
+        hi_c = max(vc, c0 + cols[-1]) if cols.size else vc
+        # Lava never rests on ghost cells, so the 1-cell margin stays inside the padded grid.
+        lo_r, hi_r, lo_c, hi_c = lo_r - 1, hi_r + 1, lo_c - 1, hi_c + 1
+        self._search = (max(lo_r - 1, 0), min(hi_r + 1, nr - 1), max(lo_c - 1, 0), min(hi_c + 1, nc - 1))
+        return slice(lo_r, hi_r + 1), slice(lo_c, hi_c + 1)
+
     def step(self, emission_rate_m3_per_min: float, dt_min: float = 1.0) -> None:
-        """Advance one time step: emit, cool, flow (advecting heat), drain sinks, solidify."""
+        """Advance one time step: emit, cool, flow (advecting heat), drain sinks, solidify.
+
+        All operations are vectorised over the window around the lava (see ``_window``).
+        """
         p = self.params
         A = self.cell_area_m2
-        h, heat = self._h, self._heat
 
         # 1. Emission at the vent, at the eruption temperature.
         if emission_rate_m3_per_min > 0:
             vr, vc = self._vent_p
             dh = emission_rate_m3_per_min * dt_min / A
-            h[vr, vc] += dh
-            heat[vr, vc] += dh * p.initial_temp_c
+            self._h[vr, vc] += dh
+            self._heat[vr, vc] += dh * p.initial_temp_c
             self.emitted_m3 += emission_rate_m3_per_min * dt_min
+
+        win = self._window()
+        h = self._h[win]  # views: in-place updates write to the model state
+        heat = self._heat[win]
+        kind = self._kind[win]
 
         # 2. Newtonian cooling of cells holding lava (applied to T, stored as h*T).
         wet = h > 0
-        heat[wet] = h[wet] * newton_cooling(heat[wet] / h[wet], p, dt_min)
-        temp = self._temperature()
+        temp = np.full(h.shape, p.ambient_temp_c)
+        temp[wet] = newton_cooling(heat[wet] / h[wet], p, dt_min)
+        heat[wet] = h[wet] * temp[wet]
 
-        # 3. Mobility.
-        mob = mobility(temp, p)
-
+        # 3. Mobility (local, see ``mobility``).
         # 4. Flow towards lower neighbours (synchronous update).
         #    - outflow = flow_coef * mobility * min(h, max_drop / 2): moving more than half
         #      of the largest surface drop would invert the gradient with the lowest
@@ -429,44 +462,51 @@ class LavaFlowModel:
         #      (drop / distance; diagonals are sqrt(2) cells away);
         #    - each volume q moved from A to B carries heat q*T_A, so B ends at the
         #      volume-weighted mean temperature of its previous and incoming lava.
-        z = self._ground + self._solid + h
+        #    Sources are the window's inner cells; the outer ring only receives.
+        z = self._ground[win] + self._solid[win] + h
+        zi, hi, ti = z[1:-1, 1:-1], h[1:-1, 1:-1], temp[1:-1, 1:-1]
+        source = hi > p.lava_epsilon_m
+        nr, nc = z.shape
+        drops = np.empty((len(_NEIGHBOURS),) + zi.shape)
+        slopes = np.empty_like(drops)
+        for k, (dr, dc, dist) in enumerate(_NEIGHBOURS):
+            d = zi - z[1 + dr : nr - 1 + dr, 1 + dc : nc - 1 + dc]
+            d = np.where(source & (d > 0), d, 0.0)
+            drops[k] = d
+            slopes[k] = d / dist
+        ssum = slopes.sum(axis=0)
+        moving = ssum > 0
+        out = np.where(
+            moving, p.flow_coef * mobility(ti, p) * np.minimum(hi, 0.5 * drops.max(axis=0)), 0.0
+        )
+        share = out / np.where(moving, ssum, 1.0)
         new_h = h.copy()
         new_heat = heat.copy()
-        for r, c in np.argwhere(h > p.lava_epsilon_m):
-            downhill = []
-            for dr, dc, dist in _NEIGHBOURS:
-                d = z[r, c] - z[r + dr, c + dc]
-                if d > 0:
-                    downhill.append((r + dr, c + dc, d, d / dist))
-            if not downhill:
-                continue
-            max_drop = max(d for _, _, d, _ in downhill)
-            out = p.flow_coef * float(mob[r, c]) * min(h[r, c], 0.5 * max_drop)
-            t_src = temp[r, c]
-            ssum = sum(sl for _, _, _, sl in downhill)
-            new_h[r, c] -= out
-            new_heat[r, c] -= out * t_src
-            for rr, cc, _, sl in downhill:
-                q = out * (sl / ssum)
-                new_h[rr, cc] += q
-                new_heat[rr, cc] += q * t_src
+        new_h[1:-1, 1:-1] -= out
+        new_heat[1:-1, 1:-1] -= out * ti
+        for k, (dr, dc, _) in enumerate(_NEIGHBOURS):
+            q = share * slopes[k]
+            new_h[1 + dr : nr - 1 + dr, 1 + dc : nc - 1 + dc] += q
+            new_heat[1 + dr : nr - 1 + dr, 1 + dc : nc - 1 + dc] += q * ti
         h[:] = new_h
         heat[:] = new_heat
 
         # 5. Sinks: lava reaching the sea/nodata or the grid boundary leaves the domain.
-        for kind, attr in ((SEA, "lost_sea_m3"), (BOUNDARY, "lost_boundary_m3")):
-            mask = self._kind == kind
-            setattr(self, attr, getattr(self, attr) + float(np.sum(h[mask])) * A)
-            h[mask] = 0.0
-            heat[mask] = 0.0
+        for sink_kind, attr in ((SEA, "lost_sea_m3"), (BOUNDARY, "lost_boundary_m3")):
+            mask = kind == sink_kind
+            if mask.any():
+                setattr(self, attr, getattr(self, attr) + float(np.sum(h[mask])) * A)
+                h[mask] = 0.0
+                heat[mask] = 0.0
 
         # 6. Solidification of cells that cooled below the threshold.
-        temp = self._temperature()
-        solidify = (h > 0) & (temp <= p.solidification_temp_c)
-        self._solid[solidify] += h[solidify]
+        wet = h > 0
+        temp = np.full(h.shape, p.ambient_temp_c)
+        temp[wet] = heat[wet] / h[wet]
+        solidify = wet & (temp <= p.solidification_temp_c)
+        self._solid[win][solidify] += h[solidify]
         h[solidify] = 0.0
-        heat[solidify] = 0.0
-        heat[h <= 0] = 0.0
+        heat[~(h > 0)] = 0.0
         self.minute += 1
 
 
