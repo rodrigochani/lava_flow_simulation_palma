@@ -267,6 +267,19 @@ def viscosity_from_temp(temp_c: np.ndarray, params: SimulationParams) -> np.ndar
     return params.viscosity_ref_pa_s * np.exp(params.arrhenius_beta * (params.initial_temp_c - temp_c))
 
 
+def mobility(temp_c: np.ndarray, params: SimulationParams) -> np.ndarray:
+    """Dimensionless, local mobility ``mu(T0) / mu(T)`` in (0, 1].
+
+    Criterion: lava erupted at T0 has mobility 1 and mobility decreases with the
+    Arrhenius-type viscosity increase as the cell cools. The value depends only on the
+    cell's own temperature, not on the rest of the grid (the previous normalisation by
+    the global viscosity maximum made the vent's mobility depend on the coldest cell on
+    the map). Values are clipped to [0, 1] for temperatures above T0.
+    """
+    ratio = viscosity_from_temp(params.initial_temp_c, params) / viscosity_from_temp(temp_c, params)
+    return np.clip(ratio, 0.0, 1.0)
+
+
 def newton_cooling(temp_c: np.ndarray, params: SimulationParams, dt_min: float = 1.0) -> np.ndarray:
     Ta = params.ambient_temp_c
     k = params.cooling_constant_per_min
@@ -399,8 +412,7 @@ class LavaFlowModel:
         temp = self._temperature()
 
         # 3. Mobility.
-        mu = viscosity_from_temp(temp, p)
-        mobility = 1.0 / (1.0 + mu / np.nanmax(mu))
+        mob = mobility(temp, p)
 
         # 4. Flow towards lower neighbours (synchronous update). Each volume q moved
         #    from A to B carries heat q*T_A, so B ends at the volume-weighted mean
@@ -416,7 +428,7 @@ class LavaFlowModel:
                     downhill.append((r + dr, c + dc, d))
             if not downhill:
                 continue
-            out = min(p.flow_coef * float(mobility[r, c]) * h[r, c], h[r, c])
+            out = min(p.flow_coef * float(mob[r, c]) * h[r, c], h[r, c])
             t_src = temp[r, c]
             dsum = sum(d for _, _, d in downhill)
             new_h[r, c] -= out
