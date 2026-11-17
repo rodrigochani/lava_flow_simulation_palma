@@ -318,7 +318,7 @@ class LavaFlowModel:
 
         self._h = np.zeros(self._ground.shape)  # active lava thickness (m)
         self._solid = np.zeros(self._ground.shape)  # solidified lava thickness (m)
-        self._temp = np.full(self._ground.shape, self.params.ambient_temp_c)
+        self._heat = np.zeros(self._ground.shape)  # heat content h*T (m * degC)
 
         self.minute = 0
         self.emitted_m3 = 0.0
@@ -336,7 +336,14 @@ class LavaFlowModel:
 
     @property
     def temperature(self) -> np.ndarray:
-        return self._temp[1:-1, 1:-1]
+        """Lava temperature (degC); cells without lava are at ambient temperature."""
+        return self._temperature()[1:-1, 1:-1]
+
+    def _temperature(self) -> np.ndarray:
+        h = self._h
+        out = np.full(h.shape, self.params.ambient_temp_c)
+        np.divide(self._heat, h, out=out, where=h > 0)
+        return out
 
     @property
     def sink_mask(self) -> np.ndarray:
@@ -349,7 +356,7 @@ class LavaFlowModel:
     def set_state(self, lava: np.ndarray, temperature: np.ndarray, solid: Optional[np.ndarray] = None) -> None:
         """Overwrite the state (used by tests). Lava already present is not counted as emitted."""
         self._h[1:-1, 1:-1] = lava
-        self._temp[1:-1, 1:-1] = np.where(lava > 0, temperature, self.params.ambient_temp_c)
+        self._heat[1:-1, 1:-1] = np.where(lava > 0, lava * temperature, 0.0)
         if solid is not None:
             self._solid[1:-1, 1:-1] = solid
         self.emitted_m3 += float(np.sum(lava) + (0.0 if solid is None else np.sum(solid))) * self.cell_area_m2
@@ -373,28 +380,34 @@ class LavaFlowModel:
 
     # -------------------------------------------------------------- dynamics
     def step(self, emission_rate_m3_per_min: float, dt_min: float = 1.0) -> None:
+        """Advance one time step: emit, cool, flow (advecting heat), drain sinks, solidify."""
         p = self.params
         A = self.cell_area_m2
-        h, temp = self._h, self._temp
+        h, heat = self._h, self._heat
 
-        # 1. Emission at the vent.
+        # 1. Emission at the vent, at the eruption temperature.
         if emission_rate_m3_per_min > 0:
             vr, vc = self._vent_p
-            h[vr, vc] += emission_rate_m3_per_min * dt_min / A
-            temp[vr, vc] = p.initial_temp_c
+            dh = emission_rate_m3_per_min * dt_min / A
+            h[vr, vc] += dh
+            heat[vr, vc] += dh * p.initial_temp_c
             self.emitted_m3 += emission_rate_m3_per_min * dt_min
 
-        # 2. Newtonian cooling of cells holding lava.
+        # 2. Newtonian cooling of cells holding lava (applied to T, stored as h*T).
         wet = h > 0
-        temp[wet] = newton_cooling(temp[wet], p, dt_min)
+        heat[wet] = h[wet] * newton_cooling(heat[wet] / h[wet], p, dt_min)
+        temp = self._temperature()
 
         # 3. Mobility.
         mu = viscosity_from_temp(temp, p)
         mobility = 1.0 / (1.0 + mu / np.nanmax(mu))
 
-        # 4. Flow towards lower neighbours (synchronous update).
+        # 4. Flow towards lower neighbours (synchronous update). Each volume q moved
+        #    from A to B carries heat q*T_A, so B ends at the volume-weighted mean
+        #    temperature of its previous lava and the incoming lava.
         z = self._ground + self._solid + h
         new_h = h.copy()
+        new_heat = heat.copy()
         for r, c in np.argwhere(h > p.lava_epsilon_m):
             downhill = []
             for dr, dc in _NEIGHBOURS:
@@ -404,25 +417,31 @@ class LavaFlowModel:
             if not downhill:
                 continue
             out = min(p.flow_coef * float(mobility[r, c]) * h[r, c], h[r, c])
+            t_src = temp[r, c]
             dsum = sum(d for _, _, d in downhill)
             new_h[r, c] -= out
+            new_heat[r, c] -= out * t_src
             for rr, cc, d in downhill:
-                new_h[rr, cc] += out * (d / dsum)
+                q = out * (d / dsum)
+                new_h[rr, cc] += q
+                new_heat[rr, cc] += q * t_src
         h[:] = new_h
+        heat[:] = new_heat
 
         # 5. Sinks: lava reaching the sea/nodata or the grid boundary leaves the domain.
         for kind, attr in ((SEA, "lost_sea_m3"), (BOUNDARY, "lost_boundary_m3")):
             mask = self._kind == kind
             setattr(self, attr, getattr(self, attr) + float(np.sum(h[mask])) * A)
             h[mask] = 0.0
+            heat[mask] = 0.0
 
-        # 6. Solidification.
+        # 6. Solidification of cells that cooled below the threshold.
+        temp = self._temperature()
         solidify = (h > 0) & (temp <= p.solidification_temp_c)
         self._solid[solidify] += h[solidify]
         h[solidify] = 0.0
-
-        # 7. Cells without lava are at ambient temperature.
-        temp[h <= 0] = p.ambient_temp_c
+        heat[solidify] = 0.0
+        heat[h <= 0] = 0.0
         self.minute += 1
 
 
