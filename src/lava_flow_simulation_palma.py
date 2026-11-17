@@ -240,21 +240,14 @@ def summit_rc(elevation: np.ndarray) -> Tuple[int, int]:
     return int(r), int(c)
 
 
-def choose_emission_point(dem: np.ndarray, emission_rc: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
-    if emission_rc is None:
-        return summit_rc(dem)
-    r, c = emission_rc
-    if not (0 <= r < dem.shape[0] and 0 <= c < dem.shape[1]):
-        raise ValueError(f"Emission point {emission_rc} is outside the grid {dem.shape}.")
-    return int(r), int(c)
-
-
 @dataclass
 class SimulationParams:
-    cell_size_m: float = 10.0
+    """Model parameters. Values are illustrative, NOT calibrated against observations."""
+
     emission_rate_m3_per_min: float = 1000.0
     pulse_minutes: int = 60
     pulses: int = 3
+    max_minutes_per_pulse: int = 240
 
     initial_temp_c: float = 1150.0
     ambient_temp_c: float = 25.0
@@ -265,9 +258,9 @@ class SimulationParams:
     arrhenius_beta: float = 0.02
     flow_coef: float = 0.45
 
+    sea_level_m: float = 0.0
     lava_epsilon_m: float = 1e-6
     snapshot_every_min: int = 1
-    max_minutes_per_pulse: int = 240
 
 
 def viscosity_from_temp(temp_c: np.ndarray, params: SimulationParams) -> np.ndarray:
@@ -280,104 +273,175 @@ def newton_cooling(temp_c: np.ndarray, params: SimulationParams, dt_min: float =
     return Ta + (temp_c - Ta) * np.exp(-k * dt_min)
 
 
-def moore_neighbors(r: int, c: int, nrows: int, ncols: int) -> List[Tuple[int, int]]:
-    out: List[Tuple[int, int]] = []
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            if dr == 0 and dc == 0:
-                continue
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < nrows and 0 <= cc < ncols:
-                out.append((rr, cc))
-    return out
+# Cell kinds on the padded grid.
+LAND, SEA, BOUNDARY = 0, 1, 2
+_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
 
 
-def compute_volumes(lava_m: np.ndarray, solid_m: np.ndarray, cell_area_m2: float) -> Tuple[float, float]:
-    lava_v = float(np.nansum(np.clip(lava_m, 0.0, None)) * cell_area_m2)
-    solid_v = float(np.nansum(np.clip(solid_m, 0.0, None)) * cell_area_m2)
-    return lava_v, solid_v
+class LavaFlowModel:
+    """Cellular-automaton lava flow on a regular grid with a 1-minute time step.
 
+    State arrays are stored with a one-cell ghost ring around the grid. Ghost cells and
+    sea/nodata cells are sinks: lava that reaches them leaves the domain and is
+    accounted for as ``lost_boundary_m3`` / ``lost_sea_m3`` in the mass balance.
+    """
 
-def simulate_one_minute(
-    dem: np.ndarray,
-    lava_m: np.ndarray,
-    solid_m: np.ndarray,
-    temp_c: np.ndarray,
-    params: SimulationParams,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    nrows, ncols = dem.shape
-    total_height = dem + solid_m + lava_m
+    def __init__(
+        self,
+        elevation: np.ndarray,
+        cell_size_m: float,
+        vent_rc: Tuple[int, int],
+        params: Optional[SimulationParams] = None,
+    ) -> None:
+        self.params = params if params is not None else SimulationParams()
+        if not (cell_size_m and cell_size_m > 0):
+            raise ValueError(f"cell_size_m must be positive, got {cell_size_m!r}")
+        elev = np.asarray(elevation, dtype=np.float64)
+        self.shape: Tuple[int, int] = elev.shape  # type: ignore[assignment]
+        self.cell_size_m = float(cell_size_m)
+        self.cell_area_m2 = self.cell_size_m**2
 
-    temp_c = newton_cooling(temp_c, params, dt_min=1.0)
-    mu = viscosity_from_temp(temp_c, params)
-    mu_norm = mu / np.nanmax(mu)
-    mobility = 1.0 / (1.0 + mu_norm)
+        sea_level = self.params.sea_level_m
+        sea = ~np.isfinite(elev) | (elev <= sea_level)
+        r, c = int(vent_rc[0]), int(vent_rc[1])
+        if not (0 <= r < self.shape[0] and 0 <= c < self.shape[1]):
+            raise ValueError(f"Vent {vent_rc} is outside the grid {self.shape}.")
+        if sea[r, c]:
+            raise ValueError(f"Vent {vent_rc} is on a sea/nodata cell.")
+        self.vent_rc = (r, c)
+        self._vent_p = (r + 1, c + 1)
 
-    new_lava = lava_m.copy()
+        ground = np.where(np.isfinite(elev), elev, sea_level)
+        self._ground = np.pad(ground, 1, mode="edge")  # ghost ring: zero-gradient ground
+        self._kind = np.full(self._ground.shape, BOUNDARY, dtype=np.int8)
+        self._kind[1:-1, 1:-1] = np.where(sea, SEA, LAND)
 
-    for r in range(nrows):
-        for c in range(ncols):
-            if lava_m[r, c] <= params.lava_epsilon_m:
-                continue
-            h_here = total_height[r, c]
-            nbrs = moore_neighbors(r, c, nrows, ncols)
+        self._h = np.zeros(self._ground.shape)  # active lava thickness (m)
+        self._solid = np.zeros(self._ground.shape)  # solidified lava thickness (m)
+        self._temp = np.full(self._ground.shape, self.params.ambient_temp_c)
+
+        self.minute = 0
+        self.emitted_m3 = 0.0
+        self.lost_sea_m3 = 0.0
+        self.lost_boundary_m3 = 0.0
+
+    # ------------------------------------------------------------------ views
+    @property
+    def lava(self) -> np.ndarray:
+        return self._h[1:-1, 1:-1]
+
+    @property
+    def solid(self) -> np.ndarray:
+        return self._solid[1:-1, 1:-1]
+
+    @property
+    def temperature(self) -> np.ndarray:
+        return self._temp[1:-1, 1:-1]
+
+    @property
+    def sink_mask(self) -> np.ndarray:
+        return self._kind[1:-1, 1:-1] == SEA
+
+    def footprint(self, eps: Optional[float] = None) -> np.ndarray:
+        eps = self.params.lava_epsilon_m if eps is None else eps
+        return (self.lava > eps) | (self.solid > eps)
+
+    def set_state(self, lava: np.ndarray, temperature: np.ndarray, solid: Optional[np.ndarray] = None) -> None:
+        """Overwrite the state (used by tests). Lava already present is not counted as emitted."""
+        self._h[1:-1, 1:-1] = lava
+        self._temp[1:-1, 1:-1] = np.where(lava > 0, temperature, self.params.ambient_temp_c)
+        if solid is not None:
+            self._solid[1:-1, 1:-1] = solid
+        self.emitted_m3 += float(np.sum(lava) + (0.0 if solid is None else np.sum(solid))) * self.cell_area_m2
+
+    # ----------------------------------------------------------- bookkeeping
+    def mass_balance(self) -> Dict[str, float]:
+        A = self.cell_area_m2
+        active = float(np.sum(self._h)) * A
+        solidified = float(np.sum(self._solid)) * A
+        accounted = active + solidified + self.lost_sea_m3 + self.lost_boundary_m3
+        rel = abs(self.emitted_m3 - accounted) / self.emitted_m3 if self.emitted_m3 > 0 else 0.0
+        return {
+            "minute": float(self.minute),
+            "emitted_m3": self.emitted_m3,
+            "active_m3": active,
+            "solidified_m3": solidified,
+            "lost_sea_m3": self.lost_sea_m3,
+            "lost_boundary_m3": self.lost_boundary_m3,
+            "relative_error": rel,
+        }
+
+    # -------------------------------------------------------------- dynamics
+    def step(self, emission_rate_m3_per_min: float, dt_min: float = 1.0) -> None:
+        p = self.params
+        A = self.cell_area_m2
+        h, temp = self._h, self._temp
+
+        # 1. Emission at the vent.
+        if emission_rate_m3_per_min > 0:
+            vr, vc = self._vent_p
+            h[vr, vc] += emission_rate_m3_per_min * dt_min / A
+            temp[vr, vc] = p.initial_temp_c
+            self.emitted_m3 += emission_rate_m3_per_min * dt_min
+
+        # 2. Newtonian cooling of cells holding lava.
+        wet = h > 0
+        temp[wet] = newton_cooling(temp[wet], p, dt_min)
+
+        # 3. Mobility.
+        mu = viscosity_from_temp(temp, p)
+        mobility = 1.0 / (1.0 + mu / np.nanmax(mu))
+
+        # 4. Flow towards lower neighbours (synchronous update).
+        z = self._ground + self._solid + h
+        new_h = h.copy()
+        for r, c in np.argwhere(h > p.lava_epsilon_m):
             downhill = []
-            for rr, cc in nbrs:
-                d = h_here - total_height[rr, cc]
+            for dr, dc in _NEIGHBOURS:
+                d = z[r, c] - z[r + dr, c + dc]
                 if d > 0:
-                    downhill.append((rr, cc, d))
+                    downhill.append((r + dr, c + dc, d))
             if not downhill:
                 continue
-
-            flow_amount = params.flow_coef * float(mobility[r, c]) * float(lava_m[r, c])
-            flow_amount = float(np.clip(flow_amount, 0.0, float(lava_m[r, c])))
-
+            out = min(p.flow_coef * float(mobility[r, c]) * h[r, c], h[r, c])
             dsum = sum(d for _, _, d in downhill)
-            if dsum <= 0:
-                continue
-
-            new_lava[r, c] -= flow_amount
+            new_h[r, c] -= out
             for rr, cc, d in downhill:
-                new_lava[rr, cc] += flow_amount * (d / dsum)
+                new_h[rr, cc] += out * (d / dsum)
+        h[:] = new_h
 
-    new_lava = np.clip(new_lava, 0.0, None)
+        # 5. Sinks: lava reaching the sea/nodata or the grid boundary leaves the domain.
+        for kind, attr in ((SEA, "lost_sea_m3"), (BOUNDARY, "lost_boundary_m3")):
+            mask = self._kind == kind
+            setattr(self, attr, getattr(self, attr) + float(np.sum(h[mask])) * A)
+            h[mask] = 0.0
 
-    solidify = (temp_c <= params.solidification_temp_c) & (new_lava > params.lava_epsilon_m)
-    solid_m = solid_m + np.where(solidify, new_lava, 0.0)
-    new_lava = np.where(solidify, 0.0, new_lava)
+        # 6. Solidification.
+        solidify = (h > 0) & (temp <= p.solidification_temp_c)
+        self._solid[solidify] += h[solidify]
+        h[solidify] = 0.0
 
-    temp_c = np.where(new_lava > params.lava_epsilon_m, temp_c, params.ambient_temp_c)
-    return new_lava, solid_m, temp_c
+        # 7. Cells without lava are at ambient temperature.
+        temp[h <= 0] = p.ambient_temp_c
+        self.minute += 1
 
 
-def render_frame(
-    dem: np.ndarray,
-    lava_m: np.ndarray,
-    emission_rc: Tuple[int, int],
-    minute: int,
-    active_lava_volume_m3: float,
-    out_png: Path,
-) -> None:
+def render_frame(model: LavaFlowModel, base: np.ndarray, out_png: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.2, 5.4), dpi=100)
-
-    dem_masked = np.ma.masked_where(dem <= 0, dem)
-    ax.imshow(dem_masked, cmap="terrain", origin="upper")
-
-    lava_masked = np.ma.masked_where(lava_m <= 1e-6, lava_m)
+    ax.imshow(np.ma.masked_where(~np.isfinite(base) | (base <= 0), base), cmap="terrain", origin="upper")
+    lava_masked = np.ma.masked_where(model.lava <= model.params.lava_epsilon_m, model.lava)
     if np.ma.count(lava_masked) > 0:
         im = ax.imshow(lava_masked, cmap="inferno", origin="upper", alpha=0.85)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("Active lava thickness (m)")
-
-    er, ec = emission_rc
+    er, ec = model.vent_rc
     ax.scatter([ec], [er], s=40, marker="o", label="Emission point")
     ax.legend(loc="upper right", fontsize=8)
-
-    ax.set_title(f"Time: {minute} min\nActive lava volume: {active_lava_volume_m3:,.1f} m³", fontsize=10)
+    active = model.mass_balance()["active_m3"]
+    ax.set_title(f"Time: {model.minute} min\nActive lava volume: {active:,.1f} m³", fontsize=10)
     ax.set_xlabel("Column (px)")
     ax.set_ylabel("Row (px)")
     fig.tight_layout()
-
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png)
     plt.close(fig)
@@ -389,107 +453,60 @@ def build_gif(frame_paths: List[Path], out_gif: Path, fps: int = 8) -> None:
     imageio.mimsave(out_gif, imgs, fps=fps)
 
 
-def run_simulation(
-    dem: np.ndarray,
-    params: SimulationParams,
-    output_dir: Path,
-    emission_rc: Optional[Tuple[int, int]] = None,
-    make_gif: bool = True,
-) -> Dict[str, object]:
+def _log(record: Dict[str, float], pulse: int) -> None:
+    print(
+        f"Pulse {pulse} - minute {int(record['minute']):4d} | "
+        f"emitted={format_volume(record['emitted_m3'])} | "
+        f"active={format_volume(record['active_m3'])} | "
+        f"solid={format_volume(record['solidified_m3'])} | "
+        f"lost(sea)={format_volume(record['lost_sea_m3'])} | "
+        f"lost(boundary)={format_volume(record['lost_boundary_m3'])} | "
+        f"rel.err={record['relative_error']:.1e}"
+    )
+
+
+def run_simulation(model: LavaFlowModel, output_dir: Path, make_gif: bool = True) -> List[Dict[str, float]]:
+    """Run all pulses. Lava still active at the end of a pulse carries over to the next one.
+
+    Returns one mass-balance record per minute.
+    """
+    p = model.params
     output_dir = ensure_dir(output_dir)
+    base = model._ground[1:-1, 1:-1].copy()
+    records: List[Dict[str, float]] = []
 
-    dem = dem.astype(np.float32)
-    emission_rc = choose_emission_point(dem, emission_rc)
-
-    cell_area = params.cell_size_m * params.cell_size_m
-    lava_m = np.zeros_like(dem, dtype=np.float32)
-    solid_m = np.zeros_like(dem, dtype=np.float32)
-    temp_c = np.full_like(dem, params.ambient_temp_c, dtype=np.float32)
-
-    for pulse in range(1, params.pulses + 1):
+    for pulse in range(1, p.pulses + 1):
         print(f"\n=== Pulse {pulse} ===")
-        frames_dir = ensure_dir(output_dir / f"pulse_{pulse}" / "frames")
+        frames_dir = output_dir / f"pulse_{pulse}" / "frames"
         frame_paths: List[Path] = []
-
-        pulse_emitted_m3 = 0.0
-
-        # Emission phase
-        for minute in range(1, params.pulse_minutes + 1):
-            dV = params.emission_rate_m3_per_min
-            dh = dV / cell_area
-            er, ec = emission_rc
-            lava_m[er, ec] += dh
-            temp_c[er, ec] = params.initial_temp_c
-            pulse_emitted_m3 += dV
-
-            lava_m, solid_m, temp_c = simulate_one_minute(dem, lava_m, solid_m, temp_c, params)
-
-            lava_v, solid_v = compute_volumes(lava_m, solid_m, cell_area)
-            total_v = lava_v + solid_v
-            diff = pulse_emitted_m3 - total_v
-
+        n_minutes = max(p.max_minutes_per_pulse, p.pulse_minutes)
+        for minute in range(1, n_minutes + 1):
+            erupting = minute <= p.pulse_minutes
+            model.step(p.emission_rate_m3_per_min if erupting else 0.0)
+            rec = model.mass_balance()
+            rec["pulse"] = float(pulse)
+            rec["footprint_cells"] = float(model.footprint().sum())
+            records.append(rec)
             if minute % 10 == 0:
-                print(
-                    f"Pulse {pulse} - minute {minute:3d} | "
-                    f"emitted={format_volume(pulse_emitted_m3)} | "
-                    f"active={format_volume(lava_v)} | "
-                    f"solid={format_volume(solid_v)} | "
-                    f"total={format_volume(total_v)} | "
-                    f"diff(emitted-total)={diff:,.1f} m³"
-                )
-
-            if params.snapshot_every_min > 0 and (minute % params.snapshot_every_min == 0):
+                _log(rec, pulse)
+            if make_gif and p.snapshot_every_min > 0 and minute % p.snapshot_every_min == 0:
                 out_png = frames_dir / f"frame_{minute:04d}.png"
-                render_frame(dem, lava_m, emission_rc, minute, lava_v, out_png)
+                render_frame(model, base, out_png)
                 frame_paths.append(out_png)
-
-        # Relaxation phase (no emission)
-        for extra in range(1, max(1, params.max_minutes_per_pulse - params.pulse_minutes) + 1):
-            minute = params.pulse_minutes + extra
-            lava_m, solid_m, temp_c = simulate_one_minute(dem, lava_m, solid_m, temp_c, params)
-
-            lava_v, solid_v = compute_volumes(lava_m, solid_m, cell_area)
-            total_v = lava_v + solid_v
-            diff = pulse_emitted_m3 - total_v
-
-            if minute % 10 == 0:
-                print(
-                    f"Pulse {pulse} - minute {minute:3d} | "
-                    f"emitted={format_volume(pulse_emitted_m3)} | "
-                    f"active={format_volume(lava_v)} | "
-                    f"solid={format_volume(solid_v)} | "
-                    f"total={format_volume(total_v)} | "
-                    f"diff(emitted-total)={diff:,.1f} m³"
-                )
-
-            if params.snapshot_every_min > 0 and (minute % params.snapshot_every_min == 0):
-                out_png = frames_dir / f"frame_{minute:04d}.png"
-                render_frame(dem, lava_m, emission_rc, minute, lava_v, out_png)
-                frame_paths.append(out_png)
-
-            if lava_v <= 1e-6:
+            if not erupting and rec["active_m3"] <= 0.0:
                 print(f"Pulse {pulse} stopped at minute {minute}: no active lava remains.")
                 break
 
-        gif_path = output_dir / f"pulse_{pulse}_animation.gif"
         if make_gif and frame_paths:
+            gif_path = output_dir / f"pulse_{pulse}_animation.gif"
             build_gif(frame_paths, gif_path, fps=8)
             print(f'Pulse {pulse} animation saved as "{gif_path.name}"')
 
-        # Add solidified lava to DEM for the next pulse, then reset layers
-        dem = dem + solid_m
-        lava_m[:] = 0.0
-        solid_m[:] = 0.0
-        temp_c[:] = params.ambient_temp_c
+        stats = dem_stats(np.where(model.sink_mask, np.nan, base + model.solid))
+        print(f"--- Topography (land cells, incl. deposits) after pulse {pulse} ---")
+        print(f"Min: {stats['min']:.2f} m | Max: {stats['max']:.2f} m | Mean: {stats['mean']:.2f} m | Std: {stats['std']:.2f} m")
 
-        stats = dem_stats(dem)
-        print(f"--- DEM statistics after pulse {pulse} ---")
-        print(f"Min: {stats['min']:.2f} m")
-        print(f"Max: {stats['max']:.2f} m")
-        print(f"Mean: {stats['mean']:.2f} m")
-        print(f"Std dev: {stats['std']:.2f} m")
-
-    return {"output_dir": str(output_dir), "emission_rc": emission_rc}
+    return records
 
 
 def parse_args() -> argparse.Namespace:
@@ -552,21 +569,14 @@ def main() -> int:
               f"z={dem.elevation[vent.row, vent.col]:.1f} m")
 
     params = SimulationParams(
-        cell_size_m=float(dem.cell_size_m),
         emission_rate_m3_per_min=float(args.rate),
         pulse_minutes=int(args.pulse_minutes),
         pulses=int(args.pulses),
         snapshot_every_min=int(args.snapshot_every),
         max_minutes_per_pulse=int(args.max_minutes_per_pulse),
     )
-
-    run_simulation(
-        dem=dem.elevation,
-        params=params,
-        output_dir=out_dir,
-        emission_rc=emission_rc,
-        make_gif=(not args.no_gif),
-    )
+    model = LavaFlowModel(dem.elevation, dem.cell_size_m, emission_rc, params)
+    run_simulation(model, out_dir, make_gif=(not args.no_gif))
 
     print("\nDone.")
     print(f"Outputs written to: {out_dir}")
