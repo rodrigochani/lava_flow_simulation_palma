@@ -1,8 +1,8 @@
 # La Palma Lava Flow Simulation
 
 A simple cellular-automaton (CA) lava flow simulator, inspired by the 2021 eruption of
-Cumbre Vieja (La Palma, Canary Islands). It runs on a synthetic Gaussian hill or on a
-DEM of La Palma.
+Cumbre Vieja (La Palma, Canary Islands). It runs on a synthetic Gaussian hill or on the
+Copernicus GLO-30 surface model of La Palma.
 
 > **Status.** This is an educational/exploratory model. Its parameters are illustrative
 > and **have not been calibrated**, and its output **has not been validated** against
@@ -16,10 +16,11 @@ DEM of La Palma.
 
 ![Final lava thickness on the La Palma DEM](docs/figures/real_final_thickness.png)
 
-*Illustrative run on the La Palma DEM, with the vent at the Tajogaite cone (command
-below): molten + solidified lava thickness over a hillshade of the pre-eruption DEM,
+*Illustrative run on the Copernicus GLO-30 DSM of La Palma, with the vent at the
+Tajogaite cone (command below): molten + solidified lava thickness over a hillshade of
+the pre-eruption surface,
 after three 6-hour pulses at 600 m³/min. Uncalibrated parameters. Footprint
-0.242 km², straight-line run-out 570 m.*
+0.196 km², straight-line run-out 596 m.*
 
 ## What the model does
 
@@ -56,39 +57,63 @@ tracked every step. The tests require it to close with relative error < 1e-6. In
 practice the error is ~1e-16 (float64 round-off).
 
 Only the cells near the lava are processed: the bounding box of cells with lava, plus
-a one-cell margin. The example run on the 1684 × 1076 La Palma grid (1287 simulated
-minutes) takes about 20 s, including reprojection, figures and GIF.
+a one-cell margin. The example run on the 1693 × 1106 La Palma grid (1303 simulated
+minutes) takes about 35 s, including reprojection, figures and GIF.
 
 ### Input data
 
-**DEM (`data/DEM_LaPalma.tif`).** This is **pre-eruption topography**: it shows the
-terrain before the 2021 lava flows were emplaced, and the model never updates it with
-the real 2021 deposits.
+**Default DEM: Copernicus DEM GLO-30 (`data/DEM_LaPalma_COP30.tif`).**
 
-- Source: **[TO BE COMPLETED: source / producer]**
-- Original resolution: **[TO BE COMPLETED]**
-- Acquisition / reference date: **[TO BE COMPLETED]**
-- File as distributed here: GeoTIFF, `int16` elevations in metres, EPSG:3857, pixels
-  of 30.92 × 35.19 m in map units, nodata = −32768, sea at 0 m.
+- **Product:** Copernicus DEM GLO-30 Public (2021 release, as distributed on AWS
+  Open Data). The file is a mosaic of tiles `Copernicus_DSM_COG_10_N28_00_W018_00_DEM`
+  and `Copernicus_DSM_COG_10_N28_00_W019_00_DEM`, cropped to La Palma with a
+  ~2 km (0.02°) sea margin. The western tile is needed because the island reaches
+  ~18.007° W. Ocean areas are 0 m.
+- **It is a DSM, not a bare-earth DTM:** it represents the surface "including
+  buildings, infrastructure and vegetation". On La Palma this includes, for example,
+  trees, plantations, greenhouses and buildings.
+- **Pre-eruption:** the data were acquired by the TanDEM-X mission between 2011 and
+  2015 (gaps filled with older elevation models), before the 2021 eruption. It does not
+  contain the 2021 lava flows, and the model never adds them.
+- **Native resolution and CRS:** 1 arc-second (~27 m E–W × ~31 m N–S at 28.6° N),
+  geographic WGS 84 (EPSG:4326), float32 elevations in metres.
+- **Source:** `s3://copernicus-dem-30m` (<https://registry.opendata.aws/copernicus-dem/>),
+  accessed 2026-11-17. To rebuild the file, run `python scripts/download_dem.py`; see
+  [`data/README.md`](data/README.md).
+- **Licence:** GLO-30 Public is "available on a free basis for the general public
+  under the terms and conditions of the Licence" (AWS registry). That licence is the
+  ESA user licence for Copernicus DEM / Copernicus Contributing Missions data, linked
+  from the [COP-DEM collection page](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM).
+- **Attribution.** The bucket readme only links to the licence, so this text comes from
+  the "User Obligations" of the COP-DEM page above, in the form for adapted or modified
+  data:
+
+  > produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence
+  > and Space GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA;
+  > all rights reserved
+
+**Legacy DEM (`data/DEM_LaPalma.tif`, `--dem-source legacy`).** Source not recorded;
+likely a 1-arcsec global DEM reprojected to EPSG:3857. Stored as `int16` metres,
+EPSG:3857, with pixels of 30.92 × 35.19 m in map units, nodata = −32768 and sea at 0 m.
+It was the default in earlier versions and is kept only for comparison.
 
 ### Georeferencing
 
-- `data/DEM_LaPalma.tif` is in Web Mercator (EPSG:3857), with ~31 × 35 m pixels in
-  map units. Web Mercator distances are not ground distances (they are scaled by
-  ~1/cos(latitude)). The DEM is therefore reprojected with `rasterio.warp` (bilinear)
-  to **UTM zone 28N (EPSG:32628)**. The cell size (29.6 m with GDAL's default
-  resolution) is read from the transform. `--cell-size` overrides it, with a
-  warning. `--resolution` sets the target resolution.
+- Both DEMs are reprojected with `rasterio.warp` (bilinear) to **UTM zone 28N
+  (EPSG:32628)**. Neither native grid has square metric cells: Copernicus is in degrees,
+  and the legacy DEM is in Web Mercator, whose distances are scaled by ~1/cos(latitude).
+  The cell size (29.6 m with GDAL's default resolution) is read from the transform.
+  `--cell-size` overrides it, with a warning. `--resolution` sets the target resolution.
 - The vent is read from a layer of `data/Emission_Pt.gpkg` and reprojected to the
   DEM's CRS. The script stops with an error if the vent falls outside the DEM, on
   nodata, or on the sea.
 - **Default vent: the Tajogaite cone.** The default layer is `2836460n_1751580w`
   (28°36'46"N 17°51'58"W), the Tajogaite cone of the 2021 eruption: pixel
-  (1036, 475) of the reprojected DEM, at 950 m.
+  (1006, 548) of the reprojected Copernicus DEM, at 943 m.
 - **Why the default changed.** Earlier versions used layer `emision_pto` (28.6253 N,
-  17.8403 W). That point lies 2.9 km ENE of the Tajogaite cone and 316 m higher
-  (1266 m in the reprojected DEM), on terrain that drains to the north, so it does not
-  represent the 2021 vent. It is still available with
+  17.8403 W). That point lies 2.9 km ENE of the Tajogaite cone and ~320 m higher
+  (1264 m in the reprojected Copernicus DEM), on terrain that drains to the north, so it
+  does not represent the 2021 vent. It is still available with
   `--emission-layer emision_pto`.
 
 ## Quick start
@@ -96,7 +121,7 @@ the real 2021 deposits.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest            # 19 tests
+python -m pytest            # 30 tests
 ```
 
 Synthetic Gaussian hill (100 × 100 cells, 10 m, vent at the summit, default
@@ -106,7 +131,8 @@ parameters):
 python src/lava_flow_simulation_palma.py --mode gaussian
 ```
 
-La Palma DEM, with the vent at the Tajogaite cone. This is the command used for the
+La Palma (Copernicus GLO-30 DSM by default; add `--dem-source legacy` for the old
+DEM), with the vent at the Tajogaite cone. This is the command used for the
 figures in `docs/figures/`: three 6-hour pulses at 600 m³/min (10 m³/s), each
 followed by up to 4 h without emission. This illustrative scenario totals
 648,000 m³, a tiny fraction of the volume erupted in 2021:
@@ -169,10 +195,11 @@ vent. That choice is not an estimate of the real cooling rate.
 - **Grid and time-step dependence.** The CA rule is not derived from a discretised
   flow equation. The front advances at most one cell per minute, and results depend
   on cell size and `flow_coef`. No convergence study has been done.
-- **Topography.** The DEM is pre-eruption topography (see
-  [Input data](#input-data)), resampled at least once: its ~31 × 35 m Web Mercator
-  grid was bilinearly reprojected to ~30 m UTM cells. Treating sea and nodata cells as
-  sinks ignores lava deltas and offshore emplacement.
+- **Topography.** The default DEM is a pre-eruption **surface** model (DSM, 2011–2015
+  acquisitions; see [Input data](#input-data)). Vegetation, greenhouses and buildings
+  appear as relief that real lava would bury or destroy. The 1-arcsec grid was
+  bilinearly reprojected to ~30 m UTM cells. Treating sea and nodata cells as sinks
+  ignores lava deltas and offshore emplacement.
 - **Vent and scenario.** A single point vent at the Tajogaite cone and a constant
   rate per pulse, over about a day. The 2021 eruption had several vents, and its
   effusion rate changed over the ~85 days of activity. The runs are illustrative
@@ -181,11 +208,12 @@ vent. That choice is not an estimate of the real cooling rate.
 ## Repository layout
 
 - `src/lava_flow_simulation_palma.py`: model, I/O and command-line interface.
-- `tests/`: pytest suite covering georeferencing, propagation, mass conservation,
-  symmetry, heat advection, mobility and a CLI smoke test.
-- `data/`: input DEMs (`DEM_LaPalma.tif`, plus `DEM_gaussian.tif`, which the
-  script doesn't use) and the emission points (`Emission_Pt.gpkg`, two layers). The
-  Landsat 8 image and `output.png` belong to the legacy notebook.
+- `scripts/download_dem.py`: rebuilds `data/DEM_LaPalma_COP30.tif` from the Copernicus
+  GLO-30 tiles.
+- `tests/`: pytest suite covering georeferencing on both DEMs, propagation, mass
+  conservation, symmetry, heat advection, mobility and a CLI smoke test.
+- `data/`: input DEMs and emission points; see [`data/README.md`](data/README.md).
+  The Landsat 8 image and `output.png` belong to the legacy notebook.
 - `docs/figures/`: example figures generated with the commands above.
 - `notebooks/legacy/lava_flow_simulation_palma.ipynb`: the **original exploratory
   prototype**, kept for reference. It is self-contained (it also uses `scipy`),
