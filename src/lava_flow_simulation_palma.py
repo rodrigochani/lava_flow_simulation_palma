@@ -67,6 +67,14 @@ def gaussian_dem(n: int = 100, height: float = 100.0, sigma: float = 15.0) -> np
 
 # --------------------------------------------------------------------------- georeferencing
 DEFAULT_TARGET_CRS = "EPSG:32628"  # WGS 84 / UTM zone 28N (metric on the ground at La Palma)
+# DEM files in data/ selectable with --dem-source (see README "Input data").
+DEM_SOURCES = {
+    # Copernicus DEM GLO-30 (DSM), EPSG:4326, built by scripts/download_dem.py.
+    "copernicus": "DEM_LaPalma_COP30.tif",
+    # Legacy file: source not recorded; likely a 1-arcsec global DEM reprojected to EPSG:3857.
+    "legacy": "DEM_LaPalma.tif",
+}
+DEFAULT_DEM_SOURCE = "copernicus"
 # Default vent: Tajogaite cone, 2021 eruption (28 36'46"N 17 51'58"W). The other layer in
 # Emission_Pt.gpkg, "emision_pto", lies ~2.9 km ENE and can still be selected explicitly.
 DEFAULT_EMISSION_LAYER = "2836460n_1751580w"
@@ -767,7 +775,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Default: output/<mode>/")
 
     g = p.add_argument_group("real DEM")
-    g.add_argument("--dem-path", type=str, default="DEM_LaPalma.tif")
+    g.add_argument("--dem-source", choices=sorted(DEM_SOURCES), default=DEFAULT_DEM_SOURCE,
+                   help="copernicus: Copernicus GLO-30 (default); legacy: original DEM of unrecorded source.")
+    g.add_argument("--dem-path", type=str, default=None,
+                   help="Explicit DEM file (overrides --dem-source).")
     g.add_argument("--emission-gpkg", type=str, default="Emission_Pt.gpkg")
     g.add_argument("--emission-layer", type=str, default=DEFAULT_EMISSION_LAYER)
     g.add_argument("--target-crs", type=str, default=DEFAULT_TARGET_CRS,
@@ -816,7 +827,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         title = f"Synthetic Gaussian DEM ({args.n} x {args.n} cells, {cell_size:g} m)"
         vent_info: Dict[str, object] = {"row": emission_rc[0], "col": emission_rc[1]}
     else:
-        dem_path = Path(args.dem_path)
+        dem_path = Path(args.dem_path or DEM_SOURCES[args.dem_source])
         if not dem_path.is_absolute():
             dem_path = data_dir / dem_path
         gpkg = Path(args.emission_gpkg)
@@ -831,7 +842,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         z_vent = float(dem.elevation[vent.row, vent.col])
         print(f"DEM: {dem.shape[0]} x {dem.shape[1]} cells, {dem.cell_size_m:.2f} m, CRS {dem.crs}")
         print(f"Vent: pixel ({vent.row}, {vent.col}), x={vent.x:.1f}, y={vent.y:.1f}, z={z_vent:.1f} m")
-        title = f"La Palma DEM ({dem.crs}, {dem.cell_size_m:.1f} m cells)"
+        source_label = {"copernicus": "Copernicus GLO-30 DSM", "legacy": "legacy DEM"}[args.dem_source] \
+            if args.dem_path is None else dem_path.name
+        title = f"La Palma, {source_label} ({dem.crs}, {dem.cell_size_m:.1f} m cells)"
         vent_info = {"row": vent.row, "col": vent.col, "x": vent.x, "y": vent.y, "z_m": z_vent}
 
     params = SimulationParams(
@@ -864,7 +877,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "mode": args.mode,
         "command_line_args": vars(args),
         "params": asdict(params),
-        "grid": {"shape": list(dem.shape), "cell_size_m": dem.cell_size_m,
+        "grid": {"dem_file": None if args.mode == "gaussian" else str(dem_path),
+                 "shape": list(dem.shape), "cell_size_m": dem.cell_size_m,
                  "crs": str(dem.crs) if dem.crs else None},
         "vent": vent_info,
         "minutes_simulated": model.minute,

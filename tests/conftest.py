@@ -20,9 +20,18 @@ def data_dir() -> Path:
     return DATA_DIR
 
 
+DEM_FILES = {"copernicus": "DEM_LaPalma_COP30.tif", "legacy": "DEM_LaPalma.tif"}
+
+
+@pytest.fixture(scope="session", params=sorted(DEM_FILES))
+def dem_source(request) -> str:
+    """Run DEM-dependent tests on both the Copernicus (default) and the legacy DEM."""
+    return request.param
+
+
 @pytest.fixture(scope="session")
-def dem_path(data_dir: Path) -> Path:
-    return data_dir / "DEM_LaPalma.tif"
+def dem_path(data_dir: Path, dem_source: str) -> Path:
+    return data_dir / DEM_FILES[dem_source]
 
 
 @pytest.fixture(scope="session")
