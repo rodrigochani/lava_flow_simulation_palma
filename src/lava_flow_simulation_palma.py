@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -65,15 +65,6 @@ def gaussian_dem(n: int = 100, height: float = 100.0, sigma: float = 15.0) -> np
     return dem.astype(np.float32)
 
 
-def dem_stats(dem: np.ndarray) -> Dict[str, float]:
-    return {
-        "min": float(np.nanmin(dem)),
-        "max": float(np.nanmax(dem)),
-        "mean": float(np.nanmean(dem)),
-        "std": float(np.nanstd(dem)),
-    }
-
-
 # --------------------------------------------------------------------------- georeferencing
 DEFAULT_TARGET_CRS = "EPSG:32628"  # WGS 84 / UTM zone 28N (metric on the ground at La Palma)
 DEFAULT_EMISSION_LAYER = "emision_pto"
@@ -89,6 +80,7 @@ class DEM:
     transform: Optional["Affine"] = None
     crs: Optional["CRS"] = None
     cell_size_m: Optional[float] = None
+    cell_size_override_m: Optional[float] = None
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -188,7 +180,8 @@ def load_dem(
             UserWarning,
             stacklevel=2,
         )
-    return DEM(elevation=elevation, transform=transform, crs=crs, cell_size_m=cell)
+    return DEM(elevation=elevation, transform=transform, crs=crs, cell_size_m=cell,
+               cell_size_override_m=cell_size_override_m)
 
 
 def load_emission_point(
@@ -264,7 +257,6 @@ class SimulationParams:
 
     sea_level_m: float = 0.0
     lava_epsilon_m: float = 1e-6
-    snapshot_every_min: int = 1
 
 
 def viscosity_from_temp(temp_c: np.ndarray, params: SimulationParams) -> np.ndarray:
@@ -510,31 +502,209 @@ class LavaFlowModel:
         self.minute += 1
 
 
-def render_frame(model: LavaFlowModel, base: np.ndarray, out_png: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 5.4), dpi=100)
-    ax.imshow(np.ma.masked_where(~np.isfinite(base) | (base <= 0), base), cmap="terrain", origin="upper")
-    lava_masked = np.ma.masked_where(model.lava <= model.params.lava_epsilon_m, model.lava)
-    if np.ma.count(lava_masked) > 0:
-        im = ax.imshow(lava_masked, cmap="inferno", origin="upper", alpha=0.85)
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("Active lava thickness (m)")
-    er, ec = model.vent_rc
-    ax.scatter([ec], [er], s=40, marker="o", label="Emission point")
-    ax.legend(loc="upper right", fontsize=8)
-    active = model.mass_balance()["active_m3"]
-    ax.set_title(f"Time: {model.minute} min\nActive lava volume: {active:,.1f} m³", fontsize=10)
-    ax.set_xlabel("Column (px)")
-    ax.set_ylabel("Row (px)")
-    fig.tight_layout()
+# ------------------------------------------------------------------------------- outputs
+# Chart ink and categorical colours (fixed order, never cycled).
+_INK, _INK_2, _GRID, _SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
+_SERIES = {"active_m3": "#2a78d6", "solidified_m3": "#eb6834", "lost_sea_m3": "#1baf7a",
+           "lost_boundary_m3": "#eda100"}
+_SERIES_LABELS = {"active_m3": "Active (molten)", "solidified_m3": "Solidified",
+                  "lost_sea_m3": "Lost to sea/nodata", "lost_boundary_m3": "Lost through grid edge"}
+_SEA_COLOR = "#cde2fb"
+
+
+@dataclass
+class Snapshot:
+    minute: int
+    row0: int
+    col0: int
+    thickness: np.ndarray  # lava + solid (m) inside the window
+
+
+def _style_axes(ax) -> None:
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_INK_2)
+    ax.tick_params(colors=_INK_2, labelsize=8)
+    ax.xaxis.label.set_color(_INK_2)
+    ax.yaxis.label.set_color(_INK_2)
+
+
+def _grid_transform(dem: DEM) -> "Affine":
+    """Georeferenced transform, or a local north-up one (origin at the lower-left corner)."""
+    from affine import Affine
+
+    if dem.transform is not None and dem.cell_size_m is not None and dem.cell_size_override_m is None:
+        return dem.transform
+    cell = float(dem.cell_size_m)
+    return Affine(cell, 0.0, 0.0, 0.0, -cell, dem.shape[0] * cell)
+
+
+def footprint_metrics(model: LavaFlowModel) -> Dict[str, float]:
+    fp = model.footprint()
+    rows, cols = np.nonzero(fp)
+    thick = model.lava + model.solid
+    if rows.size == 0:
+        return {"footprint_cells": 0.0, "footprint_area_km2": 0.0, "runout_m": 0.0, "max_thickness_m": 0.0}
+    vr, vc = model.vent_rc
+    runout = float(np.max(np.hypot(rows - vr, cols - vc))) * model.cell_size_m
+    return {
+        "footprint_cells": float(rows.size),
+        "footprint_area_km2": rows.size * model.cell_area_m2 / 1e6,
+        "runout_m": runout,  # straight-line distance vent -> farthest footprint cell centre
+        "max_thickness_m": float(thick.max()),
+    }
+
+
+def _crop_box(model: LavaFlowModel, margin_frac: float = 0.35, min_margin: int = 15) -> Tuple[int, int, int, int]:
+    fp = model.footprint()
+    rows, cols = np.nonzero(fp)
+    vr, vc = model.vent_rc
+    r0, r1 = min(rows.min(initial=vr), vr), max(rows.max(initial=vr), vr)
+    c0, c1 = min(cols.min(initial=vc), vc), max(cols.max(initial=vc), vc)
+    m = max(min_margin, int(margin_frac * max(r1 - r0, c1 - c0)))
+    nr, nc = model.shape
+    return max(r0 - m, 0), min(r1 + m, nr - 1), max(c0 - m, 0), min(c1 + m, nc - 1)
+
+
+def _plot_map(ax, model: LavaFlowModel, dem: DEM, box, thickness: np.ndarray, label: str, vmax: float):
+    from matplotlib.colors import LightSource, ListedColormap
+
+    r0, r1, c0, c1 = box
+    tr = _grid_transform(dem)
+    x0, y0 = tr * (c0, r0)
+    x1, y1 = tr * (c1 + 1, r1 + 1)
+    extent = (x0 / 1e3, x1 / 1e3, y1 / 1e3, y0 / 1e3)
+    ground = np.where(np.isfinite(dem.elevation), dem.elevation, model.params.sea_level_m)
+    win = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+    shade = LightSource(azdeg=315, altdeg=45).hillshade(
+        ground[win], vert_exag=1.0, dx=model.cell_size_m, dy=model.cell_size_m
+    )
+    ax.imshow(shade, cmap="gray", vmin=0, vmax=1, extent=extent, interpolation="nearest")
+    sea = model.sink_mask[win]
+    if sea.any():
+        ax.imshow(np.ma.masked_where(~sea, sea), cmap=ListedColormap([_SEA_COLOR]), extent=extent,
+                  interpolation="nearest")
+    thick = np.ma.masked_where(thickness[win] <= model.params.lava_epsilon_m, thickness[win])
+    reds = plt.get_cmap("Reds")
+    cmap = ListedColormap(reds(np.linspace(0.3, 1.0, 256)))
+    im = ax.imshow(thick, cmap=cmap, vmin=0.0, vmax=vmax, extent=extent, interpolation="nearest", alpha=0.9)
+    vx, vy = tr * (model.vent_rc[1] + 0.5, model.vent_rc[0] + 0.5)
+    ax.scatter([vx / 1e3], [vy / 1e3], s=60, marker="^", facecolor=_INK, edgecolor=_SURFACE, linewidth=1.5,
+               zorder=5, label="Vent")
+    ax.legend(loc="upper right", fontsize=8, frameon=True, facecolor=_SURFACE, edgecolor=_GRID)
+    georef = dem.transform is not None and dem.crs is not None and dem.cell_size_override_m is None
+    ax.set_xlabel(f"Easting (km, {dem.crs})" if georef else "x (km)")
+    ax.set_ylabel(f"Northing (km, {dem.crs})" if georef else "y (km)")
+    ax.set_title(label, fontsize=10, color=_INK, loc="left")
+    _style_axes(ax)
+    return im
+
+
+def plot_final_thickness(model: LavaFlowModel, dem: DEM, out_png: Path, title: str) -> None:
+    box = _crop_box(model)
+    thickness = model.lava + model.solid
+    met = footprint_metrics(model)
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), dpi=150, facecolor=_SURFACE)
+    vmax = max(float(np.percentile(thickness[thickness > model.params.lava_epsilon_m], 99)), 1e-3) \
+        if met["footprint_cells"] else 1.0
+    label = (f"{title}\nFinal lava thickness after {model.minute} min "
+             f"(area {met['footprint_area_km2']:.3f} km², run-out {met['runout_m']:,.0f} m)")
+    im = _plot_map(ax, model, dem, box, thickness, label, vmax)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, extend="max")
+    cbar.set_label("Lava thickness, molten + solidified (m)", color=_INK_2, fontsize=8)
+    cbar.ax.tick_params(colors=_INK_2, labelsize=8)
+    cbar.outline.set_visible(False)
+    fig.text(0.01, 0.01, "Illustrative, uncalibrated parameters. Hillshade: pre-eruption DEM. "
+             "Light blue: sea/nodata (sink).", fontsize=7, color=_INK_2)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png)
+    fig.savefig(out_png, facecolor=_SURFACE)
     plt.close(fig)
 
 
-def build_gif(frame_paths: List[Path], out_gif: Path, fps: int = 8) -> None:
-    imgs = [imageio.imread(p) for p in frame_paths]
+def plot_mass_balance(records: List[Dict[str, float]], out_png: Path, title: str) -> None:
+    t = np.array([r["minute"] for r in records])
+    fig, (ax, ax_err) = plt.subplots(2, 1, figsize=(7.5, 6.0), dpi=150, sharex=True, facecolor=_SURFACE,
+                                     gridspec_kw={"height_ratios": [3, 1.2]})
+    scale = 1e6 if max(r["emitted_m3"] for r in records) >= 1e6 else 1e3
+    unit = "10⁶ m³" if scale == 1e6 else "10³ m³"
+    emitted = np.array([r["emitted_m3"] for r in records]) / scale
+    ax.plot(t, emitted, color=_INK, lw=2, ls="--", label="Emitted")
+    end_labels = [(emitted[-1], "Emitted")]
+    for key, color in _SERIES.items():
+        y = np.array([r[key] for r in records]) / scale
+        ax.plot(t, y, color=color, lw=2, label=_SERIES_LABELS[key])
+        if y[-1] > 0.02 * max(emitted[-1], 1e-12):
+            end_labels.append((y[-1], _SERIES_LABELS[key]))
+    # Direct labels at the line ends, nudged apart so they never overlap.
+    gap = 0.06 * max(emitted.max(), 1e-12)
+    placed: List[float] = []
+    for y_end, text in sorted(end_labels, key=lambda e: e[0]):
+        y_lab = max(y_end, placed[-1] + gap) if placed else y_end
+        placed.append(y_lab)
+        ax.annotate(text, (t[-1], y_end), xytext=(t[-1] + 0.01 * (t[-1] - t[0]), y_lab), textcoords="data",
+                    fontsize=8, color=_INK_2, va="center", annotation_clip=False)
+    ax.set_xlim(t[0] - 0.02 * (t[-1] - t[0]), t[-1] + 0.02 * (t[-1] - t[0]))
+    ax.set_ylabel(f"Volume ({unit})")
+    ax.set_title(f"{title}\nMass balance: emitted = active + solidified + lost", fontsize=10,
+                 color=_INK, loc="left")
+    ax.legend(loc="upper left", fontsize=8, frameon=False)
+    ax.grid(True, color=_GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    _style_axes(ax)
+
+    err = np.array([max(r["relative_error"], 1e-18) for r in records])
+    ax_err.semilogy(t, err, color=_INK_2, lw=1.5)
+    ax_err.axhline(1e-6, color=_INK_2, lw=1, ls=":")
+    ax_err.annotate("1e-6 tolerance", (t[0], 1e-6), xytext=(2, 3), textcoords="offset points",
+                    fontsize=7, color=_INK_2)
+    ax_err.set_ylim(1e-18, 1e-4)
+    ax_err.set_ylabel("Relative error")
+    ax_err.set_xlabel("Time since start of eruption (min)")
+    ax_err.grid(True, color=_GRID, lw=0.8)
+    _style_axes(ax_err)
+    fig.align_ylabels()
+    fig.tight_layout(rect=(0, 0, 0.86, 1))
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, facecolor=_SURFACE)
+    plt.close(fig)
+
+
+def write_mass_balance_csv(records: List[Dict[str, float]], out_csv: Path) -> None:
+    cols = ["pulse", "minute", "emitted_m3", "active_m3", "solidified_m3", "lost_sea_m3",
+            "lost_boundary_m3", "relative_error", "footprint_cells"]
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write(",".join(cols) + "\n")
+        for r in records:
+            f.write(",".join(f"{r[c]:.0f}" if c in ("pulse", "minute", "footprint_cells") else f"{r[c]:.6e}"
+                             for c in cols) + "\n")
+
+
+def render_animation(model: LavaFlowModel, dem: DEM, snapshots: List[Snapshot], out_gif: Path,
+                     title: str, fps: int = 6) -> None:
+    """Render stored snapshots on the final crop box and assemble them into a GIF."""
+    if not snapshots:
+        return
+    box = _crop_box(model)
+    vmax = max(float(np.max([s.thickness.max() for s in snapshots])), 1e-3)
+    frames = []
+    full = np.zeros(model.shape)
+    for snap in snapshots:
+        full[:] = 0.0
+        h, w = snap.thickness.shape
+        full[snap.row0 : snap.row0 + h, snap.col0 : snap.col0 + w] = snap.thickness
+        fig, ax = plt.subplots(figsize=(6.4, 5.6), dpi=90, facecolor=_SURFACE)
+        im = _plot_map(ax, model, dem, box, full, f"{title} | t = {snap.minute} min", vmax)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Lava thickness (m)", color=_INK_2, fontsize=8)
+        cbar.outline.set_visible(False)
+        fig.tight_layout()
+        fig.canvas.draw()
+        frames.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
+        plt.close(fig)
     out_gif.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimsave(out_gif, imgs, fps=fps)
+    imageio.mimsave(out_gif, frames, duration=1.0 / fps)
 
 
 def _log(record: Dict[str, float], pulse: int) -> None:
@@ -549,20 +719,20 @@ def _log(record: Dict[str, float], pulse: int) -> None:
     )
 
 
-def run_simulation(model: LavaFlowModel, output_dir: Path, make_gif: bool = True) -> List[Dict[str, float]]:
-    """Run all pulses. Lava still active at the end of a pulse carries over to the next one.
+def run_simulation(model: LavaFlowModel, snapshot_every_min: int = 0,
+                   verbose: bool = True) -> Tuple[List[Dict[str, float]], List[Snapshot]]:
+    """Run all pulses. Each pulse erupts for ``pulse_minutes`` and then relaxes without
+    emission up to ``max_minutes_per_pulse`` (or until no molten lava remains). Lava still
+    molten at the end of a pulse carries over to the next one.
 
-    Returns one mass-balance record per minute.
+    Returns one mass-balance record per minute and the stored thickness snapshots.
     """
     p = model.params
-    output_dir = ensure_dir(output_dir)
-    base = model._ground[1:-1, 1:-1].copy()
     records: List[Dict[str, float]] = []
-
+    snapshots: List[Snapshot] = []
     for pulse in range(1, p.pulses + 1):
-        print(f"\n=== Pulse {pulse} ===")
-        frames_dir = output_dir / f"pulse_{pulse}" / "frames"
-        frame_paths: List[Path] = []
+        if verbose:
+            print(f"\n=== Pulse {pulse} ===")
         n_minutes = max(p.max_minutes_per_pulse, p.pulse_minutes)
         for minute in range(1, n_minutes + 1):
             erupting = minute <= p.pulse_minutes
@@ -571,70 +741,78 @@ def run_simulation(model: LavaFlowModel, output_dir: Path, make_gif: bool = True
             rec["pulse"] = float(pulse)
             rec["footprint_cells"] = float(model.footprint().sum())
             records.append(rec)
-            if minute % 10 == 0:
+            if verbose and minute % 10 == 0:
                 _log(rec, pulse)
-            if make_gif and p.snapshot_every_min > 0 and minute % p.snapshot_every_min == 0:
-                out_png = frames_dir / f"frame_{minute:04d}.png"
-                render_frame(model, base, out_png)
-                frame_paths.append(out_png)
+            if snapshot_every_min > 0 and model.minute % snapshot_every_min == 0:
+                rows, cols = np.nonzero(model.footprint())
+                if rows.size:
+                    win = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
+                    snapshots.append(Snapshot(model.minute, int(rows.min()), int(cols.min()),
+                                              (model.lava + model.solid)[win].copy()))
             if not erupting and rec["active_m3"] <= 0.0:
-                print(f"Pulse {pulse} stopped at minute {minute}: no active lava remains.")
+                if verbose:
+                    print(f"Pulse {pulse} stopped at minute {minute}: no molten lava remains.")
                 break
-
-        if make_gif and frame_paths:
-            gif_path = output_dir / f"pulse_{pulse}_animation.gif"
-            build_gif(frame_paths, gif_path, fps=8)
-            print(f'Pulse {pulse} animation saved as "{gif_path.name}"')
-
-        stats = dem_stats(np.where(model.sink_mask, np.nan, base + model.solid))
-        print(f"--- Topography (land cells, incl. deposits) after pulse {pulse} ---")
-        print(f"Min: {stats['min']:.2f} m | Max: {stats['max']:.2f} m | Mean: {stats['mean']:.2f} m | Std: {stats['std']:.2f} m")
-
-    return records
+    return records, snapshots
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="La Palma lava flow simulation (English-only outputs).")
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    d = SimulationParams()
+    p = argparse.ArgumentParser(description="La Palma lava flow simulation (cellular automaton).")
     p.add_argument("--mode", choices=["gaussian", "real"], default="real")
     p.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR))
-    p.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
+    p.add_argument("--output-dir", type=str, default=None,
+                   help="Default: output/<mode>/")
 
-    # Your renamed files in data/
-    p.add_argument("--dem-path", type=str, default="DEM_LaPalma.tif")
-    p.add_argument("--emission-gpkg", type=str, default="Emission_Pt.gpkg")
-
-    p.add_argument("--pulses", type=int, default=3)
-    p.add_argument("--pulse-minutes", type=int, default=60)
-    p.add_argument("--rate", type=float, default=1000.0)
-    p.add_argument("--emission-layer", type=str, default=DEFAULT_EMISSION_LAYER)
-    p.add_argument("--target-crs", type=str, default=DEFAULT_TARGET_CRS,
+    g = p.add_argument_group("real DEM")
+    g.add_argument("--dem-path", type=str, default="DEM_LaPalma.tif")
+    g.add_argument("--emission-gpkg", type=str, default="Emission_Pt.gpkg")
+    g.add_argument("--emission-layer", type=str, default=DEFAULT_EMISSION_LAYER)
+    g.add_argument("--target-crs", type=str, default=DEFAULT_TARGET_CRS,
                    help="CRS the real DEM is reprojected to (bilinear). Default: UTM 28N.")
-    p.add_argument("--resolution", type=float, default=None,
+    g.add_argument("--resolution", type=float, default=None,
                    help="Target resolution (m) of the reprojected DEM. Default: chosen by GDAL.")
-    p.add_argument("--cell-size", type=float, default=None,
+    g.add_argument("--cell-size", type=float, default=None,
                    help="Real mode: override the cell size read from the DEM (emits a warning). "
                         "Gaussian mode: cell size of the synthetic grid (default 10 m).")
-    p.add_argument("--snapshot-every", type=int, default=1)
-    p.add_argument("--max-minutes-per-pulse", type=int, default=240)
-    p.add_argument("--no-gif", action="store_true")
 
-    # Gaussian options
-    p.add_argument("--n", type=int, default=100)
-    p.add_argument("--height", type=float, default=100.0)
-    p.add_argument("--sigma", type=float, default=15.0)
-    return p.parse_args()
+    g = p.add_argument_group("synthetic Gaussian DEM")
+    g.add_argument("--n", type=int, default=100)
+    g.add_argument("--height", type=float, default=100.0)
+    g.add_argument("--sigma", type=float, default=15.0)
+
+    g = p.add_argument_group("eruption and physics (illustrative defaults)")
+    g.add_argument("--pulses", type=int, default=d.pulses)
+    g.add_argument("--pulse-minutes", type=int, default=d.pulse_minutes)
+    g.add_argument("--max-minutes-per-pulse", type=int, default=d.max_minutes_per_pulse)
+    g.add_argument("--rate", type=float, default=d.emission_rate_m3_per_min, help="Effusion rate (m3/min).")
+    g.add_argument("--initial-temp", type=float, default=d.initial_temp_c)
+    g.add_argument("--solidification-temp", type=float, default=d.solidification_temp_c)
+    g.add_argument("--cooling", type=float, default=d.cooling_constant_per_min,
+                   help="Newtonian cooling constant k (1/min).")
+    g.add_argument("--beta", type=float, default=d.arrhenius_beta, help="Arrhenius-type viscosity slope (1/C).")
+    g.add_argument("--flow-coef", type=float, default=d.flow_coef)
+
+    g = p.add_argument_group("outputs")
+    g.add_argument("--snapshot-every", type=int, default=10, help="Minutes between GIF frames (0 = none).")
+    g.add_argument("--no-gif", action="store_true")
+    return p.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Optional[List[str]] = None) -> int:
+    import json
+
+    args = parse_args(argv)
     data_dir = Path(args.data_dir)
-    out_dir = ensure_dir(Path(args.output_dir))
+    out_dir = ensure_dir(Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR / args.mode)
 
     if args.mode == "gaussian":
         elevation = gaussian_dem(n=args.n, height=args.height, sigma=args.sigma)
         cell_size = float(args.cell_size) if args.cell_size is not None else 10.0
         dem = DEM(elevation=elevation.astype(np.float64), cell_size_m=cell_size)
         emission_rc = summit_rc(dem.elevation)
+        title = f"Synthetic Gaussian DEM ({args.n} x {args.n} cells, {cell_size:g} m)"
+        vent_info: Dict[str, object] = {"row": emission_rc[0], "col": emission_rc[1]}
     else:
         dem_path = Path(args.dem_path)
         if not dem_path.is_absolute():
@@ -648,22 +826,58 @@ def main() -> int:
             raise SystemExit("The DEM has no reliable ground cell size; use a metric --target-crs.")
         vent = load_emission_point(gpkg, dem, layer=args.emission_layer)
         emission_rc = (vent.row, vent.col)
+        z_vent = float(dem.elevation[vent.row, vent.col])
         print(f"DEM: {dem.shape[0]} x {dem.shape[1]} cells, {dem.cell_size_m:.2f} m, CRS {dem.crs}")
-        print(f"Vent: pixel ({vent.row}, {vent.col}), x={vent.x:.1f}, y={vent.y:.1f}, "
-              f"z={dem.elevation[vent.row, vent.col]:.1f} m")
+        print(f"Vent: pixel ({vent.row}, {vent.col}), x={vent.x:.1f}, y={vent.y:.1f}, z={z_vent:.1f} m")
+        title = f"La Palma DEM ({dem.crs}, {dem.cell_size_m:.1f} m cells)"
+        vent_info = {"row": vent.row, "col": vent.col, "x": vent.x, "y": vent.y, "z_m": z_vent}
 
     params = SimulationParams(
         emission_rate_m3_per_min=float(args.rate),
         pulse_minutes=int(args.pulse_minutes),
         pulses=int(args.pulses),
-        snapshot_every_min=int(args.snapshot_every),
         max_minutes_per_pulse=int(args.max_minutes_per_pulse),
+        initial_temp_c=float(args.initial_temp),
+        solidification_temp_c=float(args.solidification_temp),
+        cooling_constant_per_min=float(args.cooling),
+        arrhenius_beta=float(args.beta),
+        flow_coef=float(args.flow_coef),
     )
     model = LavaFlowModel(dem.elevation, dem.cell_size_m, emission_rc, params)
-    run_simulation(model, out_dir, make_gif=(not args.no_gif))
+    records, snapshots = run_simulation(model, snapshot_every_min=0 if args.no_gif else args.snapshot_every)
 
-    print("\nDone.")
-    print(f"Outputs written to: {out_dir}")
+    final_png = out_dir / "final_thickness.png"
+    mb_png = out_dir / "mass_balance.png"
+    mb_csv = out_dir / "mass_balance.csv"
+    plot_final_thickness(model, dem, final_png, title)
+    plot_mass_balance(records, mb_png, title)
+    write_mass_balance_csv(records, mb_csv)
+    outputs = [final_png, mb_png, mb_csv]
+    if snapshots:
+        gif = out_dir / "animation.gif"
+        render_animation(model, dem, snapshots, gif, title)
+        outputs.append(gif)
+
+    summary = {
+        "mode": args.mode,
+        "command_line_args": vars(args),
+        "params": asdict(params),
+        "grid": {"shape": list(dem.shape), "cell_size_m": dem.cell_size_m,
+                 "crs": str(dem.crs) if dem.crs else None},
+        "vent": vent_info,
+        "minutes_simulated": model.minute,
+        "final_mass_balance": model.mass_balance(),
+        "max_relative_error": max(r["relative_error"] for r in records),
+        "footprint": footprint_metrics(model),
+        "note": "Illustrative, uncalibrated parameters; not validated against observations.",
+    }
+    summary_path = out_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    outputs.append(summary_path)
+
+    print("\nDone. Outputs:")
+    for o in outputs:
+        print(f"  {o}")
     return 0
 
 
