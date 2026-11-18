@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""La Palma lava flow simulation (English-only outputs).
+"""Cellular-automaton lava flow simulator inspired by the 2021 La Palma eruption.
 
-All generated artifacts are written to ./output (or --output-dir).
+Model (one step = 1 minute, Moore neighbourhood): lava is emitted at the vent at T0,
+cools by Newtonian cooling, flows towards lower neighbours with a mobility
+mu(T0)/mu(T) from an Arrhenius-type viscosity, carries its heat with it, and solidifies
+when its temperature drops below a threshold. Sea/nodata cells and the grid edge are
+sinks. Parameters are illustrative and uncalibrated; see README.md ("Limitations").
 
-Expected repo layout:
-  data/      input DEMs and optional emission point
-  output/    generated frames, GIFs, plots
-  src/       code (this file)
-  notebooks/ interactive notebook
+Outputs are written to output/<mode>/ (or --output-dir).
 """
 
 from __future__ import annotations
