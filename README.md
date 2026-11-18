@@ -8,11 +8,18 @@ DEM of La Palma.
 > and **have not been calibrated**, and its output **has not been validated** against
 > observed lava flows. See [Limitations](#limitations).
 
+> **Illustrative scenario, not a reconstruction.** The La Palma runs place a vent at the
+> Tajogaite cone on pre-eruption topography and erupt a few hundred thousand m³ over
+> about a day. They do **not** reproduce the 2021 eruption: its ~85-day duration, its
+> changing effusion rate, its multiple vents, or the flow field that reached the sea. The
+> simulated footprint should not be read as a hindcast of the 2021 lava flows.
+
 ![Final lava thickness on the La Palma DEM](docs/figures/real_final_thickness.png)
 
-*Example run on the La Palma DEM (command below): molten + solidified lava thickness
-over a hillshade of the pre-eruption DEM, after three 6-hour pulses at 600 m³/min.
-Uncalibrated parameters.*
+*Illustrative run on the La Palma DEM, with the vent at the Tajogaite cone (command
+below): molten + solidified lava thickness over a hillshade of the pre-eruption DEM,
+after three 6-hour pulses at 600 m³/min. Uncalibrated parameters. Footprint
+0.242 km², straight-line run-out 570 m.*
 
 ## What the model does
 
@@ -49,8 +56,20 @@ tracked every step. The tests require it to close with relative error < 1e-6. In
 practice the error is ~1e-16 (float64 round-off).
 
 Only the cells near the lava are processed: the bounding box of cells with lava, plus
-a one-cell margin. The example run on the 1684 × 1076 La Palma grid (1292 simulated
-minutes) takes about 22 s, including reprojection, figures and GIF.
+a one-cell margin. The example run on the 1684 × 1076 La Palma grid (1287 simulated
+minutes) takes about 20 s, including reprojection, figures and GIF.
+
+### Input data
+
+**DEM (`data/DEM_LaPalma.tif`).** This is **pre-eruption topography**: it shows the
+terrain before the 2021 lava flows were emplaced, and the model never updates it with
+the real 2021 deposits.
+
+- Source: **[TO BE COMPLETED: source / producer]**
+- Original resolution: **[TO BE COMPLETED]**
+- Acquisition / reference date: **[TO BE COMPLETED]**
+- File as distributed here: GeoTIFF, `int16` elevations in metres, EPSG:3857, pixels
+  of 30.92 × 35.19 m in map units, nodata = −32768, sea at 0 m.
 
 ### Georeferencing
 
@@ -60,21 +79,24 @@ minutes) takes about 22 s, including reprojection, figures and GIF.
   to **UTM zone 28N (EPSG:32628)**. The cell size (29.6 m with GDAL's default
   resolution) is read from the transform. `--cell-size` overrides it, with a
   warning. `--resolution` sets the target resolution.
-- The vent is read from layer `emision_pto` of `data/Emission_Pt.gpkg` and
-  reprojected to the DEM's CRS. The script stops with an error if the vent falls
-  outside the DEM, on nodata, or on the sea.
-- **Note on the vent location.** The `emision_pto` point (28.6253 N, 17.8403 W;
-  1266 m in the reprojected DEM) is 2.9 km ENE of, and 316 m higher than, the point in
-  the other layer of the same file, `2836460n_1751580w` (28°36'46"N 17°51'58"W). Check
-  which point represents the 2021 vents before drawing conclusions from the
-  simulated path. Use `--emission-layer` to switch.
+- The vent is read from a layer of `data/Emission_Pt.gpkg` and reprojected to the
+  DEM's CRS. The script stops with an error if the vent falls outside the DEM, on
+  nodata, or on the sea.
+- **Default vent: the Tajogaite cone.** The default layer is `2836460n_1751580w`
+  (28°36'46"N 17°51'58"W), the Tajogaite cone of the 2021 eruption: pixel
+  (1036, 475) of the reprojected DEM, at 950 m.
+- **Why the default changed.** Earlier versions used layer `emision_pto` (28.6253 N,
+  17.8403 W). That point lies 2.9 km ENE of the Tajogaite cone and 316 m higher
+  (1266 m in the reprojected DEM), on terrain that drains to the north, so it does not
+  represent the 2021 vent. It is still available with
+  `--emission-layer emision_pto`.
 
 ## Quick start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest            # 16 tests
+python -m pytest            # 19 tests
 ```
 
 Synthetic Gaussian hill (100 × 100 cells, 10 m, vent at the summit, default
@@ -84,9 +106,10 @@ parameters):
 python src/lava_flow_simulation_palma.py --mode gaussian
 ```
 
-La Palma DEM. This is the command used for the figures in `docs/figures/`: three
-6-hour pulses at 600 m³/min (10 m³/s), each followed by up to 4 h without
-emission:
+La Palma DEM, with the vent at the Tajogaite cone. This is the command used for the
+figures in `docs/figures/`: three 6-hour pulses at 600 m³/min (10 m³/s), each
+followed by up to 4 h without emission. This illustrative scenario totals
+648,000 m³, a tiny fraction of the volume erupted in 2021:
 
 ```bash
 python src/lava_flow_simulation_palma.py --mode real --rate 600 --pulses 3 \
@@ -146,12 +169,14 @@ vent. That choice is not an estimate of the real cooling rate.
 - **Grid and time-step dependence.** The CA rule is not derived from a discretised
   flow equation. The front advances at most one cell per minute, and results depend
   on cell size and `flow_coef`. No convergence study has been done.
-- **Topography.** The DEM is pre-eruption and resampled twice: its original
-  ~31 × 35 m Web Mercator grid was bilinearly reprojected to ~30 m UTM cells. Its
-  source and acquisition date should be documented. Treating sea and nodata cells as
+- **Topography.** The DEM is pre-eruption topography (see
+  [Input data](#input-data)), resampled at least once: its ~31 × 35 m Web Mercator
+  grid was bilinearly reprojected to ~30 m UTM cells. Treating sea and nodata cells as
   sinks ignores lava deltas and offshore emplacement.
-- **Vent.** A single point vent. The 2021 eruption had several vents, and its
-  effusion rate changed over the ~85 days of activity.
+- **Vent and scenario.** A single point vent at the Tajogaite cone and a constant
+  rate per pulse, over about a day. The 2021 eruption had several vents, and its
+  effusion rate changed over the ~85 days of activity. The runs are illustrative
+  scenarios, not a reconstruction of the eruption.
 
 ## Repository layout
 
@@ -159,11 +184,12 @@ vent. That choice is not an estimate of the real cooling rate.
 - `tests/`: pytest suite covering georeferencing, propagation, mass conservation,
   symmetry, heat advection, mobility and a CLI smoke test.
 - `data/`: input DEMs (`DEM_LaPalma.tif`, plus `DEM_gaussian.tif`, which the
-  script doesn't use) and the emission point (`Emission_Pt.gpkg`). The Landsat 8 image
-  and `output.png` belong to the legacy notebook.
+  script doesn't use) and the emission points (`Emission_Pt.gpkg`, two layers). The
+  Landsat 8 image and `output.png` belong to the legacy notebook.
 - `docs/figures/`: example figures generated with the commands above.
-- `notebooks/lava_flow_simulation_palma.ipynb`: the **original exploratory
-  prototype**. It is self-contained (it also uses `scipy`), predates the fixes
-  described here, and does not reflect the current model. Its side-by-side
-  comparison with a Landsat image is qualitative only.
+- `notebooks/legacy/lava_flow_simulation_palma.ipynb`: the **original exploratory
+  prototype**, kept for reference. It is self-contained (it also uses `scipy`),
+  predates the fixes described here, and does not reflect the current model; its
+  first cell says so. Its side-by-side comparison with a Landsat image is
+  qualitative only.
 - `output/`: generated results (ignored by git).
