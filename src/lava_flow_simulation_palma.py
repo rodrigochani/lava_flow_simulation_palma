@@ -67,7 +67,9 @@ def gaussian_dem(n: int = 100, height: float = 100.0, sigma: float = 15.0) -> np
 
 # --------------------------------------------------------------------------- georeferencing
 DEFAULT_TARGET_CRS = "EPSG:32628"  # WGS 84 / UTM zone 28N (metric on the ground at La Palma)
-DEFAULT_EMISSION_LAYER = "emision_pto"
+# Default vent: Tajogaite cone, 2021 eruption (28 36'46"N 17 51'58"W). The other layer in
+# Emission_Pt.gpkg, "emision_pto", lies ~2.9 km ENE and can still be selected explicitly.
+DEFAULT_EMISSION_LAYER = "2836460n_1751580w"
 # Mercator variants: map units are metres, but ground distances are scaled by 1/cos(lat).
 _NON_METRIC_PROJECTED_EPSG = {3857, 3395, 900913, 3785, 102100}
 

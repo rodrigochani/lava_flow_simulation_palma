@@ -11,11 +11,14 @@ from shapely.geometry import Point
 
 import lava_flow_simulation_palma as lf
 
-EMISSION_LAYER = "emision_pto"
+EMISSION_LAYER = "emision_pto"  # used where the specific layer does not matter
+TAJOGAITE_LAYER = "2836460n_1751580w"
+# layer -> (row, col) from src.index(x, y) and elevation from rasterio.sample on the native DEM
+NATIVE_EXPECTED = {EMISSION_LAYER: ((942, 593), 1261.0), TAJOGAITE_LAYER: ((987, 500), 946.0)}
 
 
-def _emission_xy(gpkg_path, crs):
-    gdf = gpd.read_file(gpkg_path, layer=EMISSION_LAYER).to_crs(crs)
+def _emission_xy(gpkg_path, crs, layer=EMISSION_LAYER):
+    gdf = gpd.read_file(gpkg_path, layer=layer).to_crs(crs)
     geom = gdf.geometry.iloc[0]
     return float(geom.x), float(geom.y)
 
@@ -49,16 +52,21 @@ def utm_dem(dem_path):
     return lf.load_dem(dem_path)  # default target CRS: UTM 28N
 
 
-def test_native_grid_vent_matches_rasterio_index(native_dem, dem_path, gpkg_path):
-    """Without reprojection, the vent must be exactly src.index(x, y) = (942, 593)."""
-    vent = lf.load_emission_point(gpkg_path, native_dem, layer=EMISSION_LAYER)
+def test_default_emission_layer_is_tajogaite():
+    assert lf.DEFAULT_EMISSION_LAYER == TAJOGAITE_LAYER
+
+
+@pytest.mark.parametrize("layer", [EMISSION_LAYER, TAJOGAITE_LAYER])
+def test_native_grid_vent_matches_rasterio_index(native_dem, dem_path, gpkg_path, layer):
+    """Without reprojection, the vent must be exactly src.index(x, y)."""
+    vent = lf.load_emission_point(gpkg_path, native_dem, layer=layer)
+    expected_rc, expected_z = NATIVE_EXPECTED[layer]
     with rasterio.open(dem_path) as src:
-        x, y = _emission_xy(gpkg_path, src.crs)
-        expected_rc = src.index(x, y)
+        x, y = _emission_xy(gpkg_path, src.crs, layer)
         sampled = float(next(src.sample([(x, y)]))[0])
-    assert (vent.row, vent.col) == tuple(expected_rc) == (942, 593)
+        assert (vent.row, vent.col) == tuple(src.index(x, y)) == expected_rc
     assert native_dem.elevation[vent.row, vent.col] == pytest.approx(sampled)
-    assert sampled == pytest.approx(1261.0)
+    assert sampled == pytest.approx(expected_z)
 
 
 def test_default_dem_is_utm28n(utm_dem):
@@ -73,19 +81,20 @@ def test_cell_size_is_read_from_transform(utm_dem):
     assert 20.0 < utm_dem.cell_size_m < 40.0
 
 
-def test_reprojected_vent_is_inside_valid_and_matches_sample(utm_dem, gpkg_path):
-    vent = lf.load_emission_point(gpkg_path, utm_dem, layer=EMISSION_LAYER)
+@pytest.mark.parametrize("layer", [EMISSION_LAYER, TAJOGAITE_LAYER])
+def test_reprojected_vent_is_inside_valid_and_matches_sample(utm_dem, gpkg_path, layer):
+    vent = lf.load_emission_point(gpkg_path, utm_dem, layer=layer)
     nrows, ncols = utm_dem.elevation.shape
     assert 0 <= vent.row < nrows and 0 <= vent.col < ncols
     z = utm_dem.elevation[vent.row, vent.col]
     assert np.isfinite(z) and z > 0.0
 
-    x, y = _emission_xy(gpkg_path, utm_dem.crs)
+    x, y = _emission_xy(gpkg_path, utm_dem.crs, layer)
     assert (vent.x, vent.y) == pytest.approx((x, y))
     # Elevation at the vent cell equals what rasterio.sample returns at the vent point.
     assert z == pytest.approx(_sample_dem(utm_dem, x, y))
     # ... and stays close to the native-grid value (bilinear resampling on a steep cone).
-    assert abs(z - 1261.0) < 50.0
+    assert abs(z - NATIVE_EXPECTED[layer][1]) < 50.0
 
 
 def test_vent_outside_dem_raises(utm_dem, tmp_path):
